@@ -1,0 +1,11 @@
+[package]
+name = "joes-intermediate-tracker"
+version = "0.1.0"
+edition = "2024"
+description = "Joe's Intermediate Tracker CLI"
+
+[dependencies]
+
+[[bin]]
+name = "jit"
+path = "src/main.rs"
