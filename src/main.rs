@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const APP_NAME: &str = "Joe's Intermediate Tracker";
 const SESSION_REMOTE: &str = "jit";
-const SESSION_STATUS_LIMIT: usize = 5;
+const SESSION_STATUS_LIMIT: usize = 3;
 
 #[derive(Debug, Parser)]
 #[command(name = "jit", version, about = APP_NAME)]
@@ -19,60 +19,50 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum CommandArgs {
-    /// Initializes a new session with the given name on local and remote.
+    /// Initializes a new session from the active branch on local and remote.
     SessionInit {
-        /// Name for this JIT session.
-        session_name: String,
         /// Skip the interactive private session repository warning.
         #[arg(short = 'q', long = "quiet")]
         quiet: bool,
     },
     /// Show JIT session status.
     Status,
-    /// Sync working tree changes into a JIT session branch.
-    Sync {
-        /// Session name to sync. Defaults to the active session branch.
-        session_name: Option<String>,
-    },
-    /// Commit a JIT session branch to the original repository and remove the private session branch.
-    Commit {
-        /// Session name to commit. Inferred when exactly one session exists.
-        session_name: Option<String>,
-    },
+    /// Sync working tree changes into the active JIT session branch.
+    Sync,
+    /// Commit the active JIT session branch to the original repository and remove the private session branch.
+    Commit,
     /// Check out a local JIT session branch.
     Checkout {
-        /// Session name to check out.
+        /// Branch name to pass to git checkout.
         session_name: String,
     },
-    /// Load the commit from a JIT session branch into the working tree.
-    Pull {
-        /// Session name to pull. Inferred when exactly one session exists.
-        session_name: Option<String>,
+    /// Commit all local changes with git.
+    Promote {
+        /// Arguments to pass through to git commit.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        commit_args: Vec<String>,
     },
-    /// Reset the working tree to the base commit of a JIT session.
-    Reset {
-        /// Session name to reset. Inferred when exactly one session exists.
-        session_name: Option<String>,
-    },
+    /// Load the commit from the active JIT session branch into the working tree.
+    Pull,
+    /// Reset the working tree to the base commit of the active JIT session.
+    Reset,
 }
 
 fn main() -> ExitCode {
     match Cli::parse().command {
-        CommandArgs::SessionInit {
-            session_name,
-            quiet,
-        } => session_init(&session_name, quiet),
+        CommandArgs::SessionInit { quiet } => session_init(quiet),
         CommandArgs::Status => status(),
-        CommandArgs::Sync { session_name } => sync(session_name.as_deref()),
-        CommandArgs::Commit { session_name } => commit(session_name.as_deref()),
+        CommandArgs::Sync => sync(),
+        CommandArgs::Commit => commit(),
         CommandArgs::Checkout { session_name } => checkout(&session_name),
-        CommandArgs::Pull { session_name } => pull(session_name.as_deref()),
-        CommandArgs::Reset { session_name } => reset(session_name.as_deref()),
+        CommandArgs::Promote { commit_args } => promote(&commit_args),
+        CommandArgs::Pull => pull(),
+        CommandArgs::Reset => reset(),
     }
 }
 
-fn session_init(session_name: &str, quiet: bool) -> ExitCode {
-    match create_session_repo(session_name, quiet) {
+fn session_init(quiet: bool) -> ExitCode {
+    match create_session_repo(quiet) {
         Ok(session_repo) => {
             println!("Initialized JIT session repository `{session_repo}`.");
             ExitCode::SUCCESS
@@ -84,8 +74,8 @@ fn session_init(session_name: &str, quiet: bool) -> ExitCode {
     }
 }
 
-fn sync(session_name: Option<&str>) -> ExitCode {
-    match sync_session(session_name) {
+fn sync() -> ExitCode {
+    match sync_session() {
         Ok(session_name) => {
             println!("Synced JIT session `{session_name}`.");
             ExitCode::SUCCESS
@@ -97,8 +87,8 @@ fn sync(session_name: Option<&str>) -> ExitCode {
     }
 }
 
-fn pull(session_name: Option<&str>) -> ExitCode {
-    match pull_session(session_name) {
+fn pull() -> ExitCode {
+    match pull_session() {
         Ok(session_name) => {
             println!("Pulled JIT session `{session_name}`.");
             ExitCode::SUCCESS
@@ -110,8 +100,8 @@ fn pull(session_name: Option<&str>) -> ExitCode {
     }
 }
 
-fn commit(session_name: Option<&str>) -> ExitCode {
-    match commit_session(session_name) {
+fn commit() -> ExitCode {
+    match commit_session() {
         Ok(session_name) => {
             println!("Committed JIT session `{session_name}` to origin.");
             ExitCode::SUCCESS
@@ -136,8 +126,18 @@ fn checkout(session_name: &str) -> ExitCode {
     }
 }
 
-fn reset(session_name: Option<&str>) -> ExitCode {
-    match reset_session(session_name) {
+fn promote(commit_args: &[String]) -> ExitCode {
+    match promote_changes(commit_args) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn reset() -> ExitCode {
+    match reset_session() {
         Ok(session_name) => {
             println!("Reset working tree to base of JIT session `{session_name}`.");
             ExitCode::SUCCESS
@@ -195,7 +195,7 @@ fn status() -> ExitCode {
 
                 let remaining = sessions.len().saturating_sub(visible_sessions.len());
                 if remaining > 0 {
-                    println!("... (+ {remaining} with olderchanges)");
+                    println!("... +{remaining} with older changes");
                 }
             }
 
@@ -255,9 +255,9 @@ struct SyncStatus {
     total_file_count: usize,
 }
 
-fn create_session_repo(session_name: &str, quiet: bool) -> Result<String, String> {
+fn create_session_repo(quiet: bool) -> Result<String, String> {
     ensure_gh_installed()?;
-    let session_name = normalize_ref_part(session_name, "session name")?;
+    let session_name = current_session_name()?;
     let session_branch = session_branch_name(&session_name)?;
 
     let session_repo = session_repository()?;
@@ -266,7 +266,7 @@ fn create_session_repo(session_name: &str, quiet: bool) -> Result<String, String
 
     ensure_private_session_repo(&session_repo)?;
     push_session_ref(&session_repo, &session_branch)?;
-    ensure_local_session_branch(&session_branch)?;
+    ensure_local_session_branch(&session_name)?;
 
     Ok(session_repo)
 }
@@ -310,11 +310,11 @@ fn push_session_ref(session_repo: &str, session_branch: &str) -> Result<(), Stri
     ])
 }
 
-fn ensure_local_session_branch(session_branch: &str) -> Result<(), String> {
-    if local_branch_exists(session_branch)? {
-        git_status(["switch", session_branch])
+fn ensure_local_session_branch(local_branch: &str) -> Result<(), String> {
+    if local_branch_exists(local_branch)? {
+        git_status(["checkout", local_branch])
     } else {
-        git_status(["switch", "-c", session_branch])
+        git_status(["checkout", "-b", local_branch])
     }
 }
 
@@ -521,17 +521,24 @@ fn active_session() -> Result<Option<String>, String> {
     let git_user_name = git_output(["config", "user.name"])?;
     let username = normalize_git_username(&git_user_name)?;
 
-    Ok(current_branch
-        .strip_prefix(&format!("jit__{username}_"))
-        .map(|session_name| session_name.to_owned()))
+    if let Some(session_name) = current_branch.strip_prefix(&format!("jit__{username}_")) {
+        Ok(Some(session_name.to_owned()))
+    } else {
+        normalize_ref_part(&current_branch, "branch name").map(Some)
+    }
 }
 
-fn sync_session(session_name: Option<&str>) -> Result<String, String> {
+fn current_session_name() -> Result<String, String> {
+    active_session()?.ok_or_else(|| {
+        "No active Git branch found. Check out a branch before running this command.".to_owned()
+    })
+}
+
+fn sync_session() -> Result<String, String> {
     let session_repo = session_repository()?;
     ensure_session_remote(&session_repo)?;
 
-    let session_name = resolve_sync_session_name(session_name)?;
-    let session_name = normalize_ref_part(&session_name, "session name")?;
+    let session_name = current_session_name()?;
     let branch_name = session_branch_name(&session_name)?;
 
     fetch_session_branch(&branch_name)?;
@@ -550,20 +557,8 @@ fn sync_session(session_name: Option<&str>) -> Result<String, String> {
     Ok(session_name)
 }
 
-fn resolve_sync_session_name(session_name: Option<&str>) -> Result<String, String> {
-    if let Some(session_name) = session_name {
-        return Ok(session_name.to_owned());
-    }
-
-    if let Some(active_session) = active_session()? {
-        return Ok(active_session);
-    }
-
-    resolve_session_name(None, "sync")
-}
-
-fn reset_session(session_name: Option<&str>) -> Result<String, String> {
-    let branch_name = resolve_and_fetch_session_branch(session_name, "reset")?;
+fn reset_session() -> Result<String, String> {
+    let branch_name = resolve_and_fetch_session_branch()?;
     let session_ref = format!("refs/remotes/{SESSION_REMOTE}/{branch_name}");
     let base_commit = git_output(["rev-parse", &format!("{session_ref}^")])?;
 
@@ -579,8 +574,8 @@ fn reset_session(session_name: Option<&str>) -> Result<String, String> {
     session_display_name_from_branch_name(&branch_name)
 }
 
-fn pull_session(session_name: Option<&str>) -> Result<String, String> {
-    let branch_name = resolve_and_fetch_session_branch(session_name, "pull")?;
+fn pull_session() -> Result<String, String> {
+    let branch_name = resolve_and_fetch_session_branch()?;
     let session_ref = format!("refs/remotes/{SESSION_REMOTE}/{branch_name}");
 
     git_status([
@@ -595,8 +590,8 @@ fn pull_session(session_name: Option<&str>) -> Result<String, String> {
     session_display_name_from_branch_name(&branch_name)
 }
 
-fn commit_session(session_name: Option<&str>) -> Result<String, String> {
-    let branch_name = resolve_and_fetch_session_branch(session_name, "commit")?;
+fn commit_session() -> Result<String, String> {
+    let branch_name = resolve_and_fetch_session_branch()?;
     let session_ref = format!("refs/remotes/{SESSION_REMOTE}/{branch_name}");
     let session_name = session_display_name_from_branch_name(&branch_name)?;
 
@@ -618,25 +613,14 @@ fn commit_session(session_name: Option<&str>) -> Result<String, String> {
 }
 
 fn checkout_session(session_name: &str) -> Result<String, String> {
-    let session_name = normalize_ref_part(session_name, "session name")?;
-    let branch_name = session_branch_name(&session_name)?;
+    git_status(["checkout", session_name])?;
 
-    if local_branch_exists(&branch_name)? {
-        git_status(["switch", &branch_name])?;
-    } else {
-        let session_repo = session_repository()?;
-        ensure_session_remote(&session_repo)?;
-        fetch_session_branch(&branch_name)?;
-        git_status([
-            "switch",
-            "--track",
-            "-c",
-            &branch_name,
-            &format!("{SESSION_REMOTE}/{branch_name}"),
-        ])?;
-    }
+    Ok(session_name.to_owned())
+}
 
-    Ok(session_name)
+fn promote_changes(commit_args: &[String]) -> Result<(), String> {
+    git_status(["add", "-A"])?;
+    git_status(std::iter::once("commit").chain(commit_args.iter().map(String::as_str)))
 }
 
 fn fetch_session_branch(branch_name: &str) -> Result<(), String> {
@@ -656,15 +640,11 @@ fn fetch_all_session_branches() -> Result<(), String> {
     ])
 }
 
-fn resolve_and_fetch_session_branch(
-    session_name: Option<&str>,
-    command_name: &str,
-) -> Result<String, String> {
+fn resolve_and_fetch_session_branch() -> Result<String, String> {
     let session_repo = session_repository()?;
     ensure_session_remote(&session_repo)?;
 
-    let session_name = resolve_session_name(session_name, command_name)?;
-    let session_name = normalize_ref_part(&session_name, "session name")?;
+    let session_name = current_session_name()?;
     let branch_name = session_branch_name(&session_name)?;
 
     fetch_session_branch(&branch_name)?;
@@ -680,22 +660,6 @@ fn session_display_name_from_branch_name(branch_name: &str) -> Result<String, St
         .strip_prefix(&format!("jit__{username}_"))
         .map(|session_name| session_name.to_owned())
         .ok_or_else(|| format!("Session branch `{branch_name}` does not belong to `{username}`."))
-}
-
-fn resolve_session_name(session_name: Option<&str>, command_name: &str) -> Result<String, String> {
-    if let Some(session_name) = session_name {
-        return Ok(session_name.to_owned());
-    }
-
-    let sessions = list_sessions()?;
-
-    match sessions.as_slice() {
-        [session] => Ok(session.name.to_owned()),
-        [] => Err("No JIT sessions found. Run `jit session-init <name>` first.".to_owned()),
-        _ => Err(format!(
-            "Multiple JIT sessions found. Run `jit {command_name} <session-name>`."
-        )),
-    }
 }
 
 fn session_branch_name(session_name: &str) -> Result<String, String> {
