@@ -3,7 +3,7 @@ use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const APP_NAME: &str = "Joe's Intermediate Tracker";
@@ -29,15 +29,20 @@ enum CommandArgs {
     },
     /// Show JIT session status.
     Status,
-    /// Push working tree changes into a JIT session branch.
-    Push {
-        /// Session name to push. Inferred when exactly one session exists.
+    /// Sync working tree changes into a JIT session branch.
+    Sync {
+        /// Session name to sync. Defaults to the active session branch.
         session_name: Option<String>,
     },
     /// Commit a JIT session branch to the original repository and remove the private session branch.
     Commit {
         /// Session name to commit. Inferred when exactly one session exists.
         session_name: Option<String>,
+    },
+    /// Check out a local JIT session branch.
+    Checkout {
+        /// Session name to check out.
+        session_name: String,
     },
     /// Load the commit from a JIT session branch into the working tree.
     Pull {
@@ -58,8 +63,9 @@ fn main() -> ExitCode {
             quiet,
         } => session_init(&session_name, quiet),
         CommandArgs::Status => status(),
-        CommandArgs::Push { session_name } => push(session_name.as_deref()),
+        CommandArgs::Sync { session_name } => sync(session_name.as_deref()),
         CommandArgs::Commit { session_name } => commit(session_name.as_deref()),
+        CommandArgs::Checkout { session_name } => checkout(&session_name),
         CommandArgs::Pull { session_name } => pull(session_name.as_deref()),
         CommandArgs::Reset { session_name } => reset(session_name.as_deref()),
     }
@@ -78,10 +84,10 @@ fn session_init(session_name: &str, quiet: bool) -> ExitCode {
     }
 }
 
-fn push(session_name: Option<&str>) -> ExitCode {
-    match push_session(session_name) {
+fn sync(session_name: Option<&str>) -> ExitCode {
+    match sync_session(session_name) {
         Ok(session_name) => {
-            println!("Pushed JIT session `{session_name}`.");
+            println!("Synced JIT session `{session_name}`.");
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -117,6 +123,19 @@ fn commit(session_name: Option<&str>) -> ExitCode {
     }
 }
 
+fn checkout(session_name: &str) -> ExitCode {
+    match checkout_session(session_name) {
+        Ok(session_name) => {
+            println!("Checked out JIT session `{session_name}`.");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn reset(session_name: Option<&str>) -> ExitCode {
     match reset_session(session_name) {
         Ok(session_name) => {
@@ -136,6 +155,7 @@ fn status() -> ExitCode {
             match sessions.iter().find(|session| session.active) {
                 Some(session) => {
                     println!("Current session: \x1b[32m*{}\x1b[0m", session.name);
+                    println!();
 
                     match session_banner_details(&session.name) {
                         Ok(details) => {
@@ -165,7 +185,7 @@ fn status() -> ExitCode {
                     let age = format_session_age(session.modified_at);
                     if session.active {
                         println!(
-                            "- \x1b[32m*{}\x1b[0m (\x1b[32m*active\x1b[0m, last modified {age})",
+                            "- \x1b[32m*{}\x1b[0m (\x1b[32m*active\x1b[0m, last sync {age})",
                             session.name
                         );
                     } else {
@@ -226,6 +246,13 @@ struct SessionBannerDetails {
     session_repo: String,
     diff_base: String,
     working_commit: String,
+    working_commit_modified_at: i64,
+    sync_status: SyncStatus,
+}
+
+struct SyncStatus {
+    unsynced_file_count: usize,
+    total_file_count: usize,
 }
 
 fn create_session_repo(session_name: &str, quiet: bool) -> Result<String, String> {
@@ -382,6 +409,8 @@ fn session_banner_details(session_name: &str) -> Result<SessionBannerDetails, St
 
     let session_ref = format!("refs/remotes/{SESSION_REMOTE}/{branch_name}");
     let working_commit = remote_branch_commit(SESSION_REMOTE, &branch_name)?;
+    let working_commit_modified_at = remote_tracking_branch_modified_at(&branch_name)?;
+    let sync_status = worktree_sync_status(&working_commit)?;
     let subject = git_output(["log", "-1", "--format=%s", &session_ref])?;
     let diff_base = if subject == "JIT sync" {
         git_output(["rev-parse", &format!("{session_ref}^")])?
@@ -394,6 +423,8 @@ fn session_banner_details(session_name: &str) -> Result<SessionBannerDetails, St
         session_repo,
         diff_base,
         working_commit,
+        working_commit_modified_at,
+        sync_status,
     })
 }
 
@@ -406,6 +437,17 @@ fn remote_branch_commit(remote: &str, branch_name: &str) -> Result<String, Strin
     Ok(commit.to_owned())
 }
 
+fn remote_tracking_branch_modified_at(branch_name: &str) -> Result<i64, String> {
+    git_output([
+        "log",
+        "-1",
+        "--format=%ct",
+        &format!("refs/remotes/{SESSION_REMOTE}/{branch_name}"),
+    ])?
+    .parse()
+    .map_err(|error| format!("Git returned an invalid commit timestamp: {error}"))
+}
+
 fn print_session_banner_details(details: &SessionBannerDetails) -> Result<(), String> {
     println!(
         "Diffbase: {}",
@@ -415,8 +457,39 @@ fn print_session_banner_details(details: &SessionBannerDetails) -> Result<(), St
         "Working commit: {}",
         commit_url_link(&details.session_repo, &details.working_commit)?
     );
+    println!(
+        "  - Last sync: {}",
+        format_session_age(details.working_commit_modified_at)
+    );
+    println!(
+        "  - Sync status: {}",
+        format_sync_status(&details.sync_status)
+    );
 
     Ok(())
+}
+
+fn format_sync_status(status: &SyncStatus) -> String {
+    if status.unsynced_file_count == 0 {
+        format!(
+            "\x1b[32mAll files synced ({})\x1b[0m",
+            pluralize_file_count(status.total_file_count)
+        )
+    } else {
+        format!(
+            "\x1b[31m{} unsynced (out of {})\x1b[0m",
+            pluralize_file_count(status.unsynced_file_count),
+            pluralize_file_count(status.total_file_count)
+        )
+    }
+}
+
+fn pluralize_file_count(count: usize) -> String {
+    if count == 1 {
+        "1 file".to_owned()
+    } else {
+        format!("{count} files")
+    }
 }
 
 fn commit_url_link(repo: &str, commit: &str) -> Result<String, String> {
@@ -453,11 +526,11 @@ fn active_session() -> Result<Option<String>, String> {
         .map(|session_name| session_name.to_owned()))
 }
 
-fn push_session(session_name: Option<&str>) -> Result<String, String> {
+fn sync_session(session_name: Option<&str>) -> Result<String, String> {
     let session_repo = session_repository()?;
     ensure_session_remote(&session_repo)?;
 
-    let session_name = resolve_session_name(session_name, "push")?;
+    let session_name = resolve_sync_session_name(session_name)?;
     let session_name = normalize_ref_part(&session_name, "session name")?;
     let branch_name = session_branch_name(&session_name)?;
 
@@ -475,6 +548,18 @@ fn push_session(session_name: Option<&str>) -> Result<String, String> {
     ])?;
 
     Ok(session_name)
+}
+
+fn resolve_sync_session_name(session_name: Option<&str>) -> Result<String, String> {
+    if let Some(session_name) = session_name {
+        return Ok(session_name.to_owned());
+    }
+
+    if let Some(active_session) = active_session()? {
+        return Ok(active_session);
+    }
+
+    resolve_session_name(None, "sync")
 }
 
 fn reset_session(session_name: Option<&str>) -> Result<String, String> {
@@ -528,6 +613,28 @@ fn commit_session(session_name: Option<&str>) -> Result<String, String> {
         &format!(":refs/heads/{branch_name}"),
     ])?;
     delete_remote_tracking_branch(&branch_name)?;
+
+    Ok(session_name)
+}
+
+fn checkout_session(session_name: &str) -> Result<String, String> {
+    let session_name = normalize_ref_part(session_name, "session name")?;
+    let branch_name = session_branch_name(&session_name)?;
+
+    if local_branch_exists(&branch_name)? {
+        git_status(["switch", &branch_name])?;
+    } else {
+        let session_repo = session_repository()?;
+        ensure_session_remote(&session_repo)?;
+        fetch_session_branch(&branch_name)?;
+        git_status([
+            "switch",
+            "--track",
+            "-c",
+            &branch_name,
+            &format!("{SESSION_REMOTE}/{branch_name}"),
+        ])?;
+    }
 
     Ok(session_name)
 }
@@ -629,6 +736,34 @@ fn write_worktree_tree() -> Result<String, String> {
         git_status_with_index(["read-tree", "HEAD"], &index_path_string)?;
         git_status_with_index(["add", "-A"], &index_path_string)?;
         git_output_with_index(["write-tree"], &index_path_string)
+    })();
+
+    let _ = fs::remove_file(index_path);
+
+    result
+}
+
+fn worktree_sync_status(working_commit: &str) -> Result<SyncStatus, String> {
+    let index_path = env::temp_dir().join(format!("jit-status-index-{}", std::process::id()));
+    let index_path_string = index_path.to_string_lossy().to_string();
+
+    let result = (|| {
+        git_status_with_index(["read-tree", working_commit], &index_path_string)?;
+        git_status_with_index(["add", "-A"], &index_path_string)?;
+        let unsynced_file_count = git_output_with_index(
+            ["diff-index", "--cached", "--name-only", working_commit],
+            &index_path_string,
+        )
+        .map(|output| output.lines().filter(|line| !line.is_empty()).count())?;
+        let total_file_count = git_output_with_index(["ls-files"], &index_path_string)?
+            .lines()
+            .filter(|line| !line.is_empty())
+            .count();
+
+        Ok(SyncStatus {
+            unsynced_file_count,
+            total_file_count,
+        })
     })();
 
     let _ = fs::remove_file(index_path);
@@ -762,6 +897,7 @@ where
 {
     let status = Command::new("git")
         .args(args)
+        .stderr(Stdio::null())
         .status()
         .map_err(|error| format!("Failed to run git: {error}"))?;
 
@@ -779,6 +915,7 @@ where
 {
     Command::new("git")
         .args(args)
+        .stderr(Stdio::null())
         .status()
         .map(|status| status.success())
         .map_err(|error| format!("Failed to run git: {error}"))
@@ -792,6 +929,7 @@ where
     let status = Command::new("git")
         .env("GIT_INDEX_FILE", index_path)
         .args(args)
+        .stderr(Stdio::null())
         .status()
         .map_err(|error| format!("Failed to run git: {error}"))?;
 
@@ -891,6 +1029,24 @@ mod tests {
             session_from_remote_tracking_ref("jit/jit__other_user_feature_test1\t123", "veryjos")
                 .map(|session| session.name),
             None
+        );
+    }
+
+    #[test]
+    fn formats_sync_status() {
+        assert_eq!(
+            super::format_sync_status(&super::SyncStatus {
+                unsynced_file_count: 0,
+                total_file_count: 3
+            }),
+            "\x1b[32mAll files synced (3 files)\x1b[0m"
+        );
+        assert_eq!(
+            super::format_sync_status(&super::SyncStatus {
+                unsynced_file_count: 1,
+                total_file_count: 3
+            }),
+            "\x1b[31m1 file unsynced (out of 3 files)\x1b[0m"
         );
     }
 }
