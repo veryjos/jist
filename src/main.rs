@@ -2,13 +2,10 @@ use clap::{Parser, Subcommand};
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
-use std::io;
-use std::process::{Command, ExitCode, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, ExitCode};
 
 const APP_NAME: &str = "Joe's Intermediate Tracker";
-const SESSION_REMOTE: &str = "jit";
-const SESSION_STATUS_LIMIT: usize = 3;
+const JIT_REMOTE: &str = "jit";
 
 #[derive(Debug, Parser)]
 #[command(name = "jit", version, about = APP_NAME)]
@@ -19,52 +16,29 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum CommandArgs {
-    /// Initializes a new session from the active branch on local and remote.
-    SessionInit {
-        /// Skip the interactive private session repository warning.
-        #[arg(short = 'q', long = "quiet")]
-        quiet: bool,
-    },
-    /// Show JIT session status.
-    Status,
-    /// Sync working tree changes into the active JIT session branch.
-    Sync,
-    /// Commit the active JIT session branch to the original repository and remove the private session branch.
-    Commit,
-    /// Check out a local JIT session branch.
-    Checkout {
-        /// Branch name to pass to git checkout.
+    /// Initialize a private JIT repository for this repo.
+    Init {
+        /// Name for this JIT session.
         session_name: String,
     },
-    /// Commit all local changes with git.
-    Promote {
-        /// Arguments to pass through to git commit.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        commit_args: Vec<String>,
-    },
-    /// Load the commit from the active JIT session branch into the working tree.
-    Pull,
-    /// Reset the working tree to the base commit of the active JIT session.
-    Reset,
+    /// Print the JIT version.
+    Version,
 }
 
 fn main() -> ExitCode {
     match Cli::parse().command {
-        CommandArgs::SessionInit { quiet } => session_init(quiet),
-        CommandArgs::Status => status(),
-        CommandArgs::Sync => sync(),
-        CommandArgs::Commit => commit(),
-        CommandArgs::Checkout { session_name } => checkout(&session_name),
-        CommandArgs::Promote { commit_args } => promote(&commit_args),
-        CommandArgs::Pull => pull(),
-        CommandArgs::Reset => reset(),
+        CommandArgs::Init { session_name } => init(&session_name),
+        CommandArgs::Version => {
+            println!("{}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
     }
 }
 
-fn session_init(quiet: bool) -> ExitCode {
-    match create_session_repo(quiet) {
-        Ok(session_repo) => {
-            println!("Initialized JIT session repository `{session_repo}`.");
+fn init(session_name: &str) -> ExitCode {
+    match init_jit_repository(session_name) {
+        Ok(repository) => {
+            println!("Initialized private JIT repository `{repository}`.");
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -74,284 +48,114 @@ fn session_init(quiet: bool) -> ExitCode {
     }
 }
 
-fn sync() -> ExitCode {
-    match sync_session() {
-        Ok(session_name) => {
-            println!("Synced JIT session `{session_name}`.");
-            ExitCode::SUCCESS
-        }
-        Err(error) => {
-            eprintln!("{error}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn pull() -> ExitCode {
-    match pull_session() {
-        Ok(session_name) => {
-            println!("Pulled JIT session `{session_name}`.");
-            ExitCode::SUCCESS
-        }
-        Err(error) => {
-            eprintln!("{error}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn commit() -> ExitCode {
-    match commit_session() {
-        Ok(session_name) => {
-            println!("Committed JIT session `{session_name}` to origin.");
-            ExitCode::SUCCESS
-        }
-        Err(error) => {
-            eprintln!("{error}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn checkout(session_name: &str) -> ExitCode {
-    match checkout_session(session_name) {
-        Ok(session_name) => {
-            println!("Checked out JIT session `{session_name}`.");
-            ExitCode::SUCCESS
-        }
-        Err(error) => {
-            eprintln!("{error}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn promote(commit_args: &[String]) -> ExitCode {
-    match promote_changes(commit_args) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("{error}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn reset() -> ExitCode {
-    match reset_session() {
-        Ok(session_name) => {
-            println!("Reset working tree to base of JIT session `{session_name}`.");
-            ExitCode::SUCCESS
-        }
-        Err(error) => {
-            eprintln!("{error}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn status() -> ExitCode {
-    match session_statuses() {
-        Ok(sessions) => {
-            match sessions.iter().find(|session| session.active) {
-                Some(session) => {
-                    println!("Current session: \x1b[32m*{}\x1b[0m", session.name);
-                    println!();
-
-                    match session_banner_details(&session.name) {
-                        Ok(details) => {
-                            if let Err(error) = print_session_banner_details(&details) {
-                                eprintln!("{error}");
-                                return ExitCode::FAILURE;
-                            }
-                        }
-                        Err(error) => {
-                            eprintln!("{error}");
-                            return ExitCode::FAILURE;
-                        }
-                    }
-                }
-                None => println!("Current session: \x1b[31mNo session\x1b[0m"),
-            }
-
-            println!();
-            println!("Sessions:");
-
-            if sessions.is_empty() {
-                println!("<no sessions>");
-            } else {
-                let visible_sessions = visible_session_statuses(&sessions);
-
-                for session in &visible_sessions {
-                    let age = format_session_age(session.modified_at);
-                    if session.active {
-                        println!(
-                            "- \x1b[32m*{}\x1b[0m (\x1b[32m*active\x1b[0m, last sync {age})",
-                            session.name
-                        );
-                    } else {
-                        println!("-  {} ({age})", session.name);
-                    }
-                }
-
-                let remaining = sessions.len().saturating_sub(visible_sessions.len());
-                if remaining > 0 {
-                    println!("... +{remaining} with older changes");
-                }
-            }
-
-            println!();
-            println!(
-                "Run \x1b[34mjit session-init\x1b[0m with your base commit checked out to start a new session."
-            );
-
-            ExitCode::SUCCESS
-        }
-        Err(error) => {
-            eprintln!("{error}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-struct SessionStatus {
-    name: String,
-    active: bool,
-    modified_at: i64,
-}
-
-struct SessionInfo {
-    name: String,
-    modified_at: i64,
-}
-
-fn visible_session_statuses(sessions: &[SessionStatus]) -> Vec<&SessionStatus> {
-    let mut visible = Vec::with_capacity(SESSION_STATUS_LIMIT.min(sessions.len()));
-
-    if let Some(active_session) = sessions.iter().find(|session| session.active) {
-        visible.push(active_session);
-    }
-
-    visible.extend(
-        sessions
-            .iter()
-            .filter(|session| !session.active)
-            .take(SESSION_STATUS_LIMIT.saturating_sub(visible.len())),
-    );
-
-    visible
-}
-
-struct SessionBannerDetails {
-    original_repo: String,
-    session_repo: String,
-    diff_base: String,
-    working_commit: String,
-    working_commit_modified_at: i64,
-    sync_status: SyncStatus,
-}
-
-struct SyncStatus {
-    unsynced_file_count: usize,
-    total_file_count: usize,
-}
-
-fn create_session_repo(quiet: bool) -> Result<String, String> {
+fn init_jit_repository(session_name: &str) -> Result<String, String> {
     ensure_gh_installed()?;
-    let session_name = current_session_name()?;
-    let session_branch = session_branch_name(&session_name)?;
 
-    let session_repo = session_repository()?;
+    let source_repo_name = repository_name()?;
+    let repository = jit_repository_name(&source_repo_name)?;
+    ensure_private_repository(&repository)?;
+    ensure_jit_remote(&repository)?;
 
-    confirm_private_session_repo(&session_repo, quiet)?;
-
-    ensure_private_session_repo(&session_repo)?;
-    push_session_ref(&session_repo, &session_branch)?;
-    ensure_local_session_branch(&session_name)?;
-
-    Ok(session_repo)
-}
-
-fn session_repository() -> Result<String, String> {
-    let repository_name = repository_name()?;
-    let session_repo_name = format!("jit-{repository_name}");
-    let owner = gh_output(["api", "user", "--jq", ".login"])?;
-
-    Ok(format!("{owner}/{session_repo_name}"))
-}
-
-fn original_repository() -> Result<String, String> {
-    gh_output([
-        "repo",
-        "view",
-        "--json",
-        "nameWithOwner",
-        "--jq",
-        ".nameWithOwner",
-    ])
-}
-
-fn ensure_private_session_repo(session_repo: &str) -> Result<(), String> {
-    if gh_success(["repo", "view", session_repo])? {
-        return Ok(());
+    if git_output(["branch", "--show-current"], None)?.is_empty() {
+        return Err("Cannot initialize JIT from a detached HEAD.".to_owned());
     }
 
-    gh_status(["repo", "create", session_repo, "--private"])
-}
-
-fn push_session_ref(session_repo: &str, session_branch: &str) -> Result<(), String> {
-    ensure_session_remote(session_repo)?;
-
-    let diff_base = git_output(["rev-parse", "HEAD"])?;
-
+    let commit = create_jit_meta_commit(session_name)?;
+    let jit_branch = jit_branch_name(session_name);
     git_status([
         "push",
-        SESSION_REMOTE,
-        &format!("{diff_base}:refs/heads/{session_branch}"),
-    ])
+        JIT_REMOTE,
+        &format!("{commit}:refs/heads/{jit_branch}"),
+    ])?;
+
+    Ok(repository)
 }
 
-fn ensure_local_session_branch(local_branch: &str) -> Result<(), String> {
-    if local_branch_exists(local_branch)? {
-        git_status(["checkout", local_branch])
-    } else {
-        git_status(["checkout", "-b", local_branch])
-    }
+fn jit_branch_name(session_name: &str) -> String {
+    format!("jit-{}", escape_ref_part(session_name))
 }
 
-fn local_branch_exists(branch_name: &str) -> Result<bool, String> {
-    git_success([
-        "show-ref",
-        "--verify",
-        "--quiet",
-        &format!("refs/heads/{branch_name}"),
-    ])
-}
-
-fn confirm_private_session_repo(session_repo: &str, quiet: bool) -> Result<(), String> {
-    if quiet {
-        return Ok(());
-    }
-
-    eprintln!(
-        "JIT will use GitHub CLI (`gh`) to create a PRIVATE session repository: {session_repo}"
-    );
-    eprintln!("This repository is intended to be PRIVATE. Continue? [y/N]");
-
-    let mut answer = String::new();
-    io::stdin()
-        .read_line(&mut answer)
-        .map_err(|error| format!("Failed to read confirmation: {error}"))?;
-
-    if matches!(answer.trim(), "y" | "Y" | "yes" | "YES" | "Yes") {
-        Ok(())
-    } else {
-        Err("Aborted before creating the private session repository.".to_owned())
-    }
+fn escape_ref_part(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '/') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches(&['.', '-', '/'])
+        .to_owned()
 }
 
 fn repository_name() -> Result<String, String> {
-    let repo = gh_output(["repo", "view", "--json", "name", "--jq", ".name"])?;
-    normalize_ref_part(&repo, "repository name")
+    gh_output(["repo", "view", "--json", "name", "--jq", ".name"])
+}
+
+fn jit_repository_name(source_repo_name: &str) -> Result<String, String> {
+    let owner = gh_output(["api", "user", "--jq", ".login"])?;
+
+    Ok(format!("{owner}/jit-{source_repo_name}"))
+}
+
+fn ensure_private_repository(repository: &str) -> Result<(), String> {
+    if gh_success(["repo", "view", repository])? {
+        return Ok(());
+    }
+
+    gh_status(["repo", "create", repository, "--private"])
+}
+
+fn ensure_jit_remote(repository: &str) -> Result<(), String> {
+    let remote_url = format!("https://github.com/{repository}.git");
+
+    match git_output(["remote", "get-url", JIT_REMOTE], None) {
+        Ok(current_url) if current_url == remote_url => Ok(()),
+        Ok(_) => git_status(["remote", "set-url", JIT_REMOTE, &remote_url]),
+        Err(_) => git_status(["remote", "add", JIT_REMOTE, &remote_url]),
+    }
+}
+
+fn create_jit_meta_commit(session_name: &str) -> Result<String, String> {
+    let head = git_output(["rev-parse", "HEAD"], None)?;
+    let index_path = env::temp_dir().join(format!("jit-init-index-{}", std::process::id()));
+    let index_path_string = index_path.to_string_lossy().to_string();
+
+    let result = (|| {
+        git_status_with_index(["read-tree", "HEAD"], &index_path_string)?;
+        let meta_blob = git_output(["hash-object", "-w", "--stdin"], Some("initialized=true\n"))?;
+        git_status_with_index(
+            [
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "100644",
+                &meta_blob,
+                ".jit-meta",
+            ],
+            &index_path_string,
+        )?;
+        let tree = git_output_with_index(["write-tree"], &index_path_string)?;
+
+        git_output(
+            [
+                "commit-tree",
+                &tree,
+                "-p",
+                &head,
+                "-m",
+                &format!("WIP: {session_name}"),
+            ],
+            None,
+        )
+    })();
+
+    let _ = fs::remove_file(index_path);
+
+    result
 }
 
 fn ensure_gh_installed() -> Result<(), String> {
@@ -359,403 +163,7 @@ fn ensure_gh_installed() -> Result<(), String> {
         .arg("--version")
         .output()
         .map(|_| ())
-        .map_err(|_| {
-            "GitHub CLI (`gh`) is required for `jit session-init`. Install it from TODO: add install link."
-                .to_owned()
-        })
-}
-
-fn list_sessions() -> Result<Vec<SessionInfo>, String> {
-    ensure_gh_installed()?;
-    let session_repo = session_repository()?;
-    ensure_session_remote(&session_repo)?;
-    fetch_all_session_branches()?;
-
-    let git_user_name = git_output(["config", "user.name"])?;
-    let username = normalize_git_username(&git_user_name)?;
-    let refs = git_output([
-        "for-each-ref",
-        "--sort=-committerdate",
-        "--format=%(refname:short)%09%(committerdate:unix)",
-        &format!("refs/remotes/{SESSION_REMOTE}/jit__{username}_*"),
-    ])?;
-
-    Ok(refs
-        .lines()
-        .filter_map(|line| session_from_remote_tracking_ref(line, &username))
-        .collect())
-}
-
-fn session_statuses() -> Result<Vec<SessionStatus>, String> {
-    let active_session = active_session()?;
-
-    Ok(list_sessions()?
-        .into_iter()
-        .map(|session| SessionStatus {
-            active: active_session.as_deref() == Some(session.name.as_str()),
-            name: session.name,
-            modified_at: session.modified_at,
-        })
-        .collect())
-}
-
-fn session_banner_details(session_name: &str) -> Result<SessionBannerDetails, String> {
-    let original_repo = original_repository()?;
-    let session_repo = session_repository()?;
-    ensure_session_remote(&session_repo)?;
-
-    let branch_name = session_branch_name(session_name)?;
-    fetch_session_branch(&branch_name)?;
-
-    let session_ref = format!("refs/remotes/{SESSION_REMOTE}/{branch_name}");
-    let working_commit = remote_branch_commit(SESSION_REMOTE, &branch_name)?;
-    let working_commit_modified_at = remote_tracking_branch_modified_at(&branch_name)?;
-    let sync_status = worktree_sync_status(&working_commit)?;
-    let subject = git_output(["log", "-1", "--format=%s", &session_ref])?;
-    let diff_base = if subject == "JIT sync" {
-        git_output(["rev-parse", &format!("{session_ref}^")])?
-    } else {
-        working_commit.clone()
-    };
-
-    Ok(SessionBannerDetails {
-        original_repo,
-        session_repo,
-        diff_base,
-        working_commit,
-        working_commit_modified_at,
-        sync_status,
-    })
-}
-
-fn remote_branch_commit(remote: &str, branch_name: &str) -> Result<String, String> {
-    let output = git_output(["ls-remote", "--heads", remote, branch_name])?;
-    let (commit, _) = output
-        .split_once('\t')
-        .ok_or_else(|| format!("Branch `{branch_name}` was not found on `{remote}`."))?;
-
-    Ok(commit.to_owned())
-}
-
-fn remote_tracking_branch_modified_at(branch_name: &str) -> Result<i64, String> {
-    git_output([
-        "log",
-        "-1",
-        "--format=%ct",
-        &format!("refs/remotes/{SESSION_REMOTE}/{branch_name}"),
-    ])?
-    .parse()
-    .map_err(|error| format!("Git returned an invalid commit timestamp: {error}"))
-}
-
-fn print_session_banner_details(details: &SessionBannerDetails) -> Result<(), String> {
-    println!(
-        "Diffbase: {}",
-        commit_url_link(&details.original_repo, &details.diff_base)?
-    );
-    println!(
-        "Working commit: {}",
-        commit_url_link(&details.session_repo, &details.working_commit)?
-    );
-    println!(
-        "  - Last sync: {}",
-        format_session_age(details.working_commit_modified_at)
-    );
-    println!(
-        "  - Sync status: {}",
-        format_sync_status(&details.sync_status)
-    );
-
-    Ok(())
-}
-
-fn format_sync_status(status: &SyncStatus) -> String {
-    if status.unsynced_file_count == 0 {
-        format!(
-            "\x1b[32mAll files synced ({})\x1b[0m",
-            pluralize_file_count(status.total_file_count)
-        )
-    } else {
-        format!(
-            "\x1b[31m{} unsynced (out of {})\x1b[0m",
-            pluralize_file_count(status.unsynced_file_count),
-            pluralize_file_count(status.total_file_count)
-        )
-    }
-}
-
-fn pluralize_file_count(count: usize) -> String {
-    if count == 1 {
-        "1 file".to_owned()
-    } else {
-        format!("{count} files")
-    }
-}
-
-fn commit_url_link(repo: &str, commit: &str) -> Result<String, String> {
-    let short_commit = short_commit_hash(commit)?;
-    let url = commit_url(repo, &short_commit);
-
-    Ok(terminal_hyperlink(&url, &url))
-}
-
-fn commit_url(repo: &str, commit: &str) -> String {
-    format!("https://github.com/{repo}/commit/{commit}")
-}
-
-fn short_commit_hash(commit: &str) -> Result<String, String> {
-    git_output(["rev-parse", "--short", commit])
-}
-
-fn terminal_hyperlink(url: &str, text: &str) -> String {
-    format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\")
-}
-
-fn active_session() -> Result<Option<String>, String> {
-    let current_branch = git_output(["branch", "--show-current"])?;
-
-    if current_branch.is_empty() {
-        return Ok(None);
-    }
-
-    let git_user_name = git_output(["config", "user.name"])?;
-    let username = normalize_git_username(&git_user_name)?;
-
-    if let Some(session_name) = current_branch.strip_prefix(&format!("jit__{username}_")) {
-        Ok(Some(session_name.to_owned()))
-    } else {
-        normalize_ref_part(&current_branch, "branch name").map(Some)
-    }
-}
-
-fn current_session_name() -> Result<String, String> {
-    active_session()?.ok_or_else(|| {
-        "No active Git branch found. Check out a branch before running this command.".to_owned()
-    })
-}
-
-fn sync_session() -> Result<String, String> {
-    let session_repo = session_repository()?;
-    ensure_session_remote(&session_repo)?;
-
-    let session_name = current_session_name()?;
-    let branch_name = session_branch_name(&session_name)?;
-
-    fetch_session_branch(&branch_name)?;
-
-    let base_ref = format!("refs/remotes/{SESSION_REMOTE}/{branch_name}");
-    let base_commit = git_output(["merge-base", "HEAD", &base_ref])?;
-    let tree = write_worktree_tree()?;
-    let commit = git_output(["commit-tree", &tree, "-p", &base_commit, "-m", "JIT sync"])?;
-
-    git_status([
-        "push",
-        SESSION_REMOTE,
-        &format!("+{commit}:refs/heads/{branch_name}"),
-    ])?;
-
-    Ok(session_name)
-}
-
-fn reset_session() -> Result<String, String> {
-    let branch_name = resolve_and_fetch_session_branch()?;
-    let session_ref = format!("refs/remotes/{SESSION_REMOTE}/{branch_name}");
-    let base_commit = git_output(["rev-parse", &format!("{session_ref}^")])?;
-
-    git_status([
-        "restore",
-        "--source",
-        &base_commit,
-        "--staged",
-        "--worktree",
-        ".",
-    ])?;
-
-    session_display_name_from_branch_name(&branch_name)
-}
-
-fn pull_session() -> Result<String, String> {
-    let branch_name = resolve_and_fetch_session_branch()?;
-    let session_ref = format!("refs/remotes/{SESSION_REMOTE}/{branch_name}");
-
-    git_status([
-        "restore",
-        "--source",
-        &session_ref,
-        "--staged",
-        "--worktree",
-        ".",
-    ])?;
-
-    session_display_name_from_branch_name(&branch_name)
-}
-
-fn commit_session() -> Result<String, String> {
-    let branch_name = resolve_and_fetch_session_branch()?;
-    let session_ref = format!("refs/remotes/{SESSION_REMOTE}/{branch_name}");
-    let session_name = session_display_name_from_branch_name(&branch_name)?;
-
-    ensure_origin_remote()?;
-
-    git_status([
-        "push",
-        "origin",
-        &format!("{session_ref}:refs/heads/{branch_name}"),
-    ])?;
-    git_status([
-        "push",
-        SESSION_REMOTE,
-        &format!(":refs/heads/{branch_name}"),
-    ])?;
-    delete_remote_tracking_branch(&branch_name)?;
-
-    Ok(session_name)
-}
-
-fn checkout_session(session_name: &str) -> Result<String, String> {
-    git_status(["checkout", session_name])?;
-
-    Ok(session_name.to_owned())
-}
-
-fn promote_changes(commit_args: &[String]) -> Result<(), String> {
-    git_status(["add", "-A"])?;
-    git_status(std::iter::once("commit").chain(commit_args.iter().map(String::as_str)))
-}
-
-fn fetch_session_branch(branch_name: &str) -> Result<(), String> {
-    git_status([
-        "fetch",
-        SESSION_REMOTE,
-        &format!("+refs/heads/{branch_name}:refs/remotes/{SESSION_REMOTE}/{branch_name}"),
-    ])
-}
-
-fn fetch_all_session_branches() -> Result<(), String> {
-    git_status([
-        "fetch",
-        "--prune",
-        SESSION_REMOTE,
-        &format!("+refs/heads/jit__*:refs/remotes/{SESSION_REMOTE}/jit__*"),
-    ])
-}
-
-fn resolve_and_fetch_session_branch() -> Result<String, String> {
-    let session_repo = session_repository()?;
-    ensure_session_remote(&session_repo)?;
-
-    let session_name = current_session_name()?;
-    let branch_name = session_branch_name(&session_name)?;
-
-    fetch_session_branch(&branch_name)?;
-
-    Ok(branch_name)
-}
-
-fn session_display_name_from_branch_name(branch_name: &str) -> Result<String, String> {
-    let git_user_name = git_output(["config", "user.name"])?;
-    let username = normalize_git_username(&git_user_name)?;
-
-    branch_name
-        .strip_prefix(&format!("jit__{username}_"))
-        .map(|session_name| session_name.to_owned())
-        .ok_or_else(|| format!("Session branch `{branch_name}` does not belong to `{username}`."))
-}
-
-fn session_branch_name(session_name: &str) -> Result<String, String> {
-    let git_user_name = git_output(["config", "user.name"])?;
-    let username = normalize_git_username(&git_user_name)?;
-
-    Ok(format!("jit__{username}_{session_name}"))
-}
-
-fn session_from_remote_tracking_ref(line: &str, username: &str) -> Option<SessionInfo> {
-    let (ref_name, modified_at) = line.split_once('\t')?;
-    let name = ref_name
-        .strip_prefix(&format!("{SESSION_REMOTE}/jit__{username}_"))
-        .map(|session_name| session_name.to_owned())?;
-    let modified_at = modified_at.parse().ok()?;
-
-    Some(SessionInfo { name, modified_at })
-}
-
-fn format_session_age(modified_at: i64) -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0);
-    let seconds = now.saturating_sub(modified_at);
-    let days = seconds / 86_400;
-    let hours = seconds % 86_400 / 3_600;
-    let minutes = seconds % 3_600 / 60;
-
-    format!("{days}d, {hours}h, {minutes}m ago")
-}
-
-fn write_worktree_tree() -> Result<String, String> {
-    let index_path = env::temp_dir().join(format!("jit-index-{}", std::process::id()));
-    let index_path_string = index_path.to_string_lossy().to_string();
-
-    let result = (|| {
-        git_status_with_index(["read-tree", "HEAD"], &index_path_string)?;
-        git_status_with_index(["add", "-A"], &index_path_string)?;
-        git_output_with_index(["write-tree"], &index_path_string)
-    })();
-
-    let _ = fs::remove_file(index_path);
-
-    result
-}
-
-fn worktree_sync_status(working_commit: &str) -> Result<SyncStatus, String> {
-    let index_path = env::temp_dir().join(format!("jit-status-index-{}", std::process::id()));
-    let index_path_string = index_path.to_string_lossy().to_string();
-
-    let result = (|| {
-        git_status_with_index(["read-tree", working_commit], &index_path_string)?;
-        git_status_with_index(["add", "-A"], &index_path_string)?;
-        let unsynced_file_count = git_output_with_index(
-            ["diff-index", "--cached", "--name-only", working_commit],
-            &index_path_string,
-        )
-        .map(|output| output.lines().filter(|line| !line.is_empty()).count())?;
-        let total_file_count = git_output_with_index(["ls-files"], &index_path_string)?
-            .lines()
-            .filter(|line| !line.is_empty())
-            .count();
-
-        Ok(SyncStatus {
-            unsynced_file_count,
-            total_file_count,
-        })
-    })();
-
-    let _ = fs::remove_file(index_path);
-
-    result
-}
-
-fn ensure_origin_remote() -> Result<(), String> {
-    git_output(["remote", "get-url", "origin"])
-        .map(|_| ())
-        .map_err(|_| "Original remote `origin` is required to commit a JIT session.".to_owned())
-}
-
-fn ensure_session_remote(session_repo: &str) -> Result<(), String> {
-    let remote_url = format!("https://github.com/{session_repo}.git");
-
-    match git_output(["remote", "get-url", SESSION_REMOTE]) {
-        Ok(current_url) if current_url == remote_url => Ok(()),
-        Ok(_) => git_status(["remote", "set-url", SESSION_REMOTE, &remote_url]),
-        Err(_) => git_status(["remote", "add", SESSION_REMOTE, &remote_url]),
-    }
-}
-
-fn delete_remote_tracking_branch(branch_name: &str) -> Result<(), String> {
-    match git_status(["branch", "-dr", &format!("{SESSION_REMOTE}/{branch_name}")]) {
-        Ok(()) => Ok(()),
-        Err(_) => Ok(()),
-    }
+        .map_err(|_| "GitHub CLI (`gh`) is required for `jit init`.".to_owned())
 }
 
 fn gh_status<I, S>(args: I) -> Result<(), String>
@@ -797,38 +205,74 @@ where
         .output()
         .map_err(|error| format!("Failed to run gh: {error}"))?;
 
-    if !output.status.success() {
-        return Err(command_error_message(
-            "GitHub CLI command failed.",
-            output.stderr.as_slice(),
-        ));
-    }
-
-    String::from_utf8(output.stdout)
-        .map(|stdout| stdout.trim().to_owned())
-        .map_err(|error| format!("GitHub CLI returned non-UTF-8 output: {error}"))
+    command_output("GitHub CLI command failed.", output)
 }
 
-fn git_output<I, S>(args: I) -> Result<String, String>
+fn git_status<I, S>(args: I) -> Result<(), String>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let output = Command::new("git")
+    let status = Command::new("git")
         .args(args)
-        .output()
+        .status()
         .map_err(|error| format!("Failed to run git: {error}"))?;
 
-    if !output.status.success() {
-        return Err(command_error_message(
-            "Git command failed.",
-            output.stderr.as_slice(),
-        ));
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("Git command failed with status {status}."))
     }
+}
 
-    String::from_utf8(output.stdout)
-        .map(|stdout| stdout.trim().to_owned())
-        .map_err(|error| format!("Git returned non-UTF-8 output: {error}"))
+fn git_status_with_index<I, S>(args: I, index_path: &str) -> Result<(), String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let status = Command::new("git")
+        .env("GIT_INDEX_FILE", index_path)
+        .args(args)
+        .status()
+        .map_err(|error| format!("Failed to run git: {error}"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("Git command failed with status {status}."))
+    }
+}
+
+fn git_output<I, S>(args: I, stdin: Option<&str>) -> Result<String, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut command = Command::new("git");
+    command.args(args);
+
+    let output = if let Some(stdin) = stdin {
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+
+                child
+                    .stdin
+                    .as_mut()
+                    .expect("stdin is piped")
+                    .write_all(stdin.as_bytes())?;
+                child.wait_with_output()
+            })
+    } else {
+        command.output()
+    }
+    .map_err(|error| format!("Failed to run git: {error}"))?;
+
+    command_output("Git command failed.", output)
 }
 
 fn git_output_with_index<I, S>(args: I, index_path: &str) -> Result<String, String>
@@ -842,175 +286,32 @@ where
         .output()
         .map_err(|error| format!("Failed to run git: {error}"))?;
 
+    command_output("Git command failed.", output)
+}
+
+fn command_output(default_message: &str, output: std::process::Output) -> Result<String, String> {
     if !output.status.success() {
-        return Err(command_error_message(
-            "Git command failed.",
-            output.stderr.as_slice(),
-        ));
+        let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(if message.is_empty() {
+            default_message.to_owned()
+        } else {
+            message
+        });
     }
 
     String::from_utf8(output.stdout)
         .map(|stdout| stdout.trim().to_owned())
-        .map_err(|error| format!("Git returned non-UTF-8 output: {error}"))
-}
-
-fn git_status<I, S>(args: I) -> Result<(), String>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    let status = Command::new("git")
-        .args(args)
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|error| format!("Failed to run git: {error}"))?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("Git command failed with status {status}."))
-    }
-}
-
-fn git_success<I, S>(args: I) -> Result<bool, String>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    Command::new("git")
-        .args(args)
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .map_err(|error| format!("Failed to run git: {error}"))
-}
-
-fn git_status_with_index<I, S>(args: I, index_path: &str) -> Result<(), String>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    let status = Command::new("git")
-        .env("GIT_INDEX_FILE", index_path)
-        .args(args)
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|error| format!("Failed to run git: {error}"))?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("Git command failed with status {status}."))
-    }
-}
-
-fn command_error_message(default_message: &str, stderr: &[u8]) -> String {
-    let message = String::from_utf8_lossy(stderr).trim().to_owned();
-
-    if message.is_empty() {
-        default_message.to_owned()
-    } else {
-        message
-    }
-}
-
-fn normalize_git_username(username: &str) -> Result<String, String> {
-    normalize_ref_part(username, "Git user.name").map_err(|_| {
-        "Git user.name is empty; set it with `git config user.name <name>`.".to_owned()
-    })
-}
-
-fn normalize_ref_part(value: &str, label: &str) -> Result<String, String> {
-    let normalized = value
-        .trim()
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>()
-        .trim_matches(&['.', '_', '-'])
-        .to_owned();
-
-    if normalized.is_empty() {
-        Err(format!("{label} cannot be empty."))
-    } else {
-        Ok(normalized)
-    }
+        .map_err(|error| format!("Command returned non-UTF-8 output: {error}"))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_git_username, normalize_ref_part, session_from_remote_tracking_ref};
-
     #[test]
-    fn normalizes_git_usernames_for_ref_names() {
-        assert_eq!(normalize_git_username("veryjos").unwrap(), "veryjos");
+    fn formats_jit_branch_name() {
+        assert_eq!(super::jit_branch_name("feature1"), "jit-feature1");
         assert_eq!(
-            normalize_git_username("Joe's Intermediate Tracker").unwrap(),
-            "Joe_s_Intermediate_Tracker"
-        );
-        assert_eq!(
-            normalize_git_username("  joe.smith  ").unwrap(),
-            "joe.smith"
-        );
-    }
-
-    #[test]
-    fn rejects_empty_git_usernames() {
-        assert!(normalize_git_username("   ").is_err());
-    }
-
-    #[test]
-    fn normalizes_session_names_for_ref_names() {
-        assert_eq!(
-            normalize_ref_part("session-1", "session name").unwrap(),
-            "session-1"
-        );
-        assert_eq!(
-            normalize_ref_part("  daily sync/session  ", "session name").unwrap(),
-            "daily_sync_session"
-        );
-    }
-
-    #[test]
-    fn rejects_empty_session_names() {
-        assert!(normalize_ref_part(" ... ", "session name").is_err());
-    }
-
-    #[test]
-    fn formats_remote_tracking_session_names_for_current_user() {
-        let session =
-            session_from_remote_tracking_ref("jit/jit__veryjos_feature_test1\t123", "veryjos")
-                .unwrap();
-
-        assert_eq!(session.name, "feature_test1");
-        assert_eq!(session.modified_at, 123);
-        assert_eq!(
-            session_from_remote_tracking_ref("jit/jit__other_user_feature_test1\t123", "veryjos")
-                .map(|session| session.name),
-            None
-        );
-    }
-
-    #[test]
-    fn formats_sync_status() {
-        assert_eq!(
-            super::format_sync_status(&super::SyncStatus {
-                unsynced_file_count: 0,
-                total_file_count: 3
-            }),
-            "\x1b[32mAll files synced (3 files)\x1b[0m"
-        );
-        assert_eq!(
-            super::format_sync_status(&super::SyncStatus {
-                unsynced_file_count: 1,
-                total_file_count: 3
-            }),
-            "\x1b[31m1 file unsynced (out of 3 files)\x1b[0m"
+            super::jit_branch_name("test session 2"),
+            "jit-test-session-2"
         );
     }
 }
