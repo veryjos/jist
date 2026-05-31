@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use notify::{RecursiveMode, Watcher};
+#[cfg(test)]
 use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsStr;
@@ -27,6 +28,8 @@ struct Cli {
 enum CommandArgs {
     /// Claim the current JIST session for this machine.
     Claim,
+    /// List all JIST sessions on the private remote.
+    List,
     /// Push the current JIST session changes if this machine owns the claim.
     Push,
     /// Create or enter a JIST session.
@@ -50,6 +53,7 @@ enum CommandArgs {
 fn main() -> ExitCode {
     match Cli::parse().command {
         CommandArgs::Claim => claim(),
+        CommandArgs::List => list(),
         CommandArgs::Push => push(),
         CommandArgs::Session { session_name } => session(&session_name),
         CommandArgs::Status => status(),
@@ -59,6 +63,19 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         CommandArgs::Work { session_name } => work(&session_name),
+    }
+}
+
+fn list() -> ExitCode {
+    match render_all_sessions() {
+        Ok(output) => {
+            print!("{output}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -126,44 +143,145 @@ fn status() -> ExitCode {
 
 fn render_status() -> Result<String, String> {
     let sessions = list_sessions()?;
-    let current_session = selected_session()?;
+    let current_head = git_output(["rev-parse", "HEAD"], None)?;
+    let current_short_head = git_output(["rev-parse", "--short", "HEAD"], None)?;
+    let selected_session = selected_session_name(&sessions, &current_head)?;
     let mut output = String::new();
 
-    match &current_session {
-        Some(session) => {
-            let links = session_links(session)?;
-            output.push_str(&format_session_state_message(
-                session,
-                &links.claim_state,
-                links.sync_status.as_ref(),
-                &links.sessionbase_url,
-                &links.sessionbase_commit_url,
-            ));
-        }
-        None => output.push_str("Session:\n  <none>\n"),
+    if let Some(session) = sessions
+        .iter()
+        .find(|session| session.working_commit == current_head)
+    {
+        output.push_str(&format_session_working_commit_status(session)?);
+        output.push('\n');
+        output.push_str("Sessions:\n");
+        let session_refs: Vec<&SessionInfo> = sessions.iter().collect();
+        output.push_str(&format_short_session_list(
+            &session_refs,
+            selected_session.as_deref(),
+        ));
+
+        return Ok(output);
     }
+
+    let (based_on_current, other_sessions): (Vec<&SessionInfo>, Vec<&SessionInfo>) = sessions
+        .iter()
+        .partition(|session| session.base_commit == current_head);
+
+    output.push_str(&format!("You are on git commit {current_short_head}.\n\n"));
+    output.push_str("The following sessions are based on this commit:\n");
+    output.push_str(&format_short_session_list(
+        &based_on_current,
+        selected_session.as_deref(),
+    ));
 
     output.push('\n');
-    output.push_str("Your sessions:\n");
+    output.push_str("Other sessions in this repository:\n");
+    output.push_str(&format_short_session_list(
+        &other_sessions,
+        selected_session.as_deref(),
+    ));
+
+    output.push('\n');
+    output.push_str("To display all sessions, type jist list.\n\n");
+    output.push_str("To work on a session, type jist work <session name>.\n");
+
+    Ok(output)
+}
+
+fn format_session_working_commit_status(session: &SessionInfo) -> Result<String, String> {
+    let original_repository = original_repository_name()?;
+    let session_url = jisthub_session_url(&original_repository, &session.name)?;
+    let short_base_commit = git_output(["rev-parse", "--short", &session.base_commit], None)?;
+
+    Ok(format!(
+        "You are checked out on session {}.\nVisit {} for detailed information.\n\nThis session is based on {}.\nTo work on this session, type {}.\n",
+        format_selected_session_name(&session.name),
+        format_url(&session_url),
+        format_blue(&short_base_commit),
+        format_blue("jist work")
+    ))
+}
+
+fn render_all_sessions() -> Result<String, String> {
+    let sessions = list_sessions()?;
+    let current_head = git_output(["rev-parse", "HEAD"], None)?;
+    let selected_session = selected_session_name(&sessions, &current_head)?;
+    let session_refs: Vec<&SessionInfo> = sessions.iter().collect();
+    let mut output = String::new();
+
+    output.push_str("Sessions:\n");
+    output.push_str(&format_full_session_list(
+        &session_refs,
+        selected_session.as_deref(),
+    ));
+
+    Ok(output)
+}
+
+fn format_short_session_list(sessions: &[&SessionInfo], selected_session: Option<&str>) -> String {
+    format_session_list(sessions, Some(STATUS_SESSION_LIMIT), selected_session)
+}
+
+fn format_full_session_list(sessions: &[&SessionInfo], selected_session: Option<&str>) -> String {
+    format_session_list(sessions, None, selected_session)
+}
+
+fn format_session_list(
+    sessions: &[&SessionInfo],
+    limit: Option<usize>,
+    selected_session: Option<&str>,
+) -> String {
+    let mut output = String::new();
+
     if sessions.is_empty() {
-        output.push_str("<no sessions>\n");
+        output.push_str("  <no sessions>\n");
     } else {
-        for session in visible_sessions(&sessions, current_session.as_deref()) {
-            if current_session.as_deref() == Some(session.name.as_str()) {
-                output.push_str(&format!(
-                    "- {}\n",
-                    format_session_list_name(&session.name, true, session.claimed)
-                ));
-            } else {
-                output.push_str(&format!(
-                    "- {}\n",
-                    format_session_list_name(&session.name, false, session.claimed)
-                ));
-            }
+        let visible_count = limit.unwrap_or(sessions.len()).min(sessions.len());
+        for session in sessions.iter().take(visible_count) {
+            output.push_str(&format!(
+                "  - {} ({})\n",
+                format_session_name(&session.name, selected_session),
+                format_last_modified(session.modified_at_unix_seconds)
+            ));
+        }
+
+        let hidden_count = sessions.len().saturating_sub(visible_count);
+        if hidden_count > 0 {
+            output.push_str(&format!(
+                "    +{hidden_count} older {}\n",
+                pluralize("session", hidden_count)
+            ));
         }
     }
 
-    Ok(output)
+    output
+}
+
+fn selected_session_name(
+    sessions: &[SessionInfo],
+    current_head: &str,
+) -> Result<Option<String>, String> {
+    if let Some(session) = sessions
+        .iter()
+        .find(|session| session.working_commit == current_head)
+    {
+        return Ok(Some(session.name.clone()));
+    }
+
+    selected_session()
+}
+
+fn format_session_name(session_name: &str, selected_session: Option<&str>) -> String {
+    if selected_session == Some(session_name) {
+        format_selected_session_name(session_name)
+    } else {
+        session_name.to_owned()
+    }
+}
+
+fn format_selected_session_name(session_name: &str) -> String {
+    format!("\x1b[32m*{session_name}\x1b[0m")
 }
 
 fn session(session_name: &str) -> ExitCode {
@@ -579,9 +697,12 @@ fn command_stdout(program: &str) -> Result<String, env::VarError> {
 
 struct SessionInfo {
     name: String,
-    claimed: bool,
+    working_commit: String,
+    base_commit: String,
+    modified_at_unix_seconds: i64,
 }
 
+#[cfg(test)]
 struct SessionLinks {
     sessionbase_url: String,
     sessionbase_commit_url: String,
@@ -589,23 +710,27 @@ struct SessionLinks {
     claim_state: ClaimState,
 }
 
+#[cfg(test)]
 struct SyncStatus {
     unsynced_files: usize,
     total_files: usize,
 }
 
+#[cfg(test)]
 enum ClaimState {
     Unclaimed,
     ClaimedByCurrentSetup,
     ClaimedByOther(ClaimeeId),
 }
 
+#[cfg(test)]
 impl ClaimState {
     fn is_claimed(&self) -> bool {
         !matches!(self, ClaimState::Unclaimed)
     }
 }
 
+#[cfg(test)]
 fn session_links(session_name: &str) -> Result<SessionLinks, String> {
     let original_repository = original_repository_name()?;
     let jist_branch = jist_branch_name(session_name);
@@ -633,6 +758,7 @@ fn session_links(session_name: &str) -> Result<SessionLinks, String> {
     })
 }
 
+#[cfg(test)]
 fn claim_state_for_branch(jist_branch: &str) -> Result<ClaimState, String> {
     match remote_claim_owner(jist_branch)? {
         Some(claim) if claim.is_current_setup()? => Ok(ClaimState::ClaimedByCurrentSetup),
@@ -641,6 +767,7 @@ fn claim_state_for_branch(jist_branch: &str) -> Result<ClaimState, String> {
     }
 }
 
+#[cfg(test)]
 fn sync_status_for_branch(jist_branch: &str) -> Result<SyncStatus, String> {
     let remote_ref = format!("refs/remotes/{JIST_REMOTE}/{jist_branch}");
     let changed_files = git_output(["diff", "--name-only", &remote_ref, "--"], None)?;
@@ -661,6 +788,7 @@ fn sync_status_for_branch(jist_branch: &str) -> Result<SyncStatus, String> {
     })
 }
 
+#[cfg(test)]
 fn non_empty_lines(value: &str) -> impl Iterator<Item = &str> {
     value.lines().filter(|line| !line.trim().is_empty())
 }
@@ -684,6 +812,7 @@ fn format_sync_status(sync_status: &SyncStatus) -> String {
     }
 }
 
+#[cfg(test)]
 fn format_session_state_message(
     session_name: &str,
     claim_state: &ClaimState,
@@ -746,6 +875,7 @@ fn format_claim_state(claim_state: &ClaimState) -> String {
     }
 }
 
+#[cfg(test)]
 fn format_current_session_name(session_name: &str, claimed: bool) -> String {
     if claimed {
         format!("\x1b[32m*\x1b[1;4m{session_name}\x1b[0m")
@@ -754,6 +884,7 @@ fn format_current_session_name(session_name: &str, claimed: bool) -> String {
     }
 }
 
+#[cfg(test)]
 fn format_session_list_name(session_name: &str, current: bool, claimed: bool) -> String {
     match (current, claimed) {
         (true, true) => format!("\x1b[32m*\x1b[1;4m{session_name}\x1b[0m"),
@@ -772,19 +903,55 @@ fn session_banner_hint(claimed: bool) -> String {
     }
 }
 
+fn format_blue(text: &str) -> String {
+    format!("\x1b[34m{text}\x1b[0m")
+}
+
 fn format_url(url: &str) -> String {
     format!("\x1b[34;4m{url}\x1b[0m")
 }
 
+#[cfg(test)]
 fn format_command(command: &str) -> String {
     format!("\x1b[32m{command}\x1b[0m")
 }
 
-#[cfg(test)]
-fn pluralize(word: &str, count: usize) -> &str {
-    if count == 1 { word } else { "files" }
+fn format_last_modified(unix_seconds: i64) -> String {
+    format!(
+        "last modified {}",
+        format_time_since_unix_seconds(unix_seconds)
+    )
 }
 
+fn format_time_since_unix_seconds(unix_seconds: i64) -> String {
+    let now_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    let elapsed_seconds = now_seconds.saturating_sub(unix_seconds).max(0) as u64;
+
+    format_duration(elapsed_seconds)
+}
+
+fn format_duration(total_seconds: u64) -> String {
+    let days = total_seconds / 86_400;
+    let hours = (total_seconds % 86_400) / 3_600;
+    let minutes = (total_seconds % 3_600) / 60;
+
+    format!("{days}d {hours}h {minutes}m ago")
+}
+
+fn pluralize(word: &str, count: usize) -> &str {
+    if count == 1 {
+        word
+    } else if word == "session" {
+        "sessions"
+    } else {
+        "files"
+    }
+}
+
+#[cfg(test)]
 fn visible_sessions<'a>(
     sessions: &'a [SessionInfo],
     current_session: Option<&str>,
@@ -822,18 +989,28 @@ fn list_sessions() -> Result<Vec<SessionInfo>, String> {
         [
             "for-each-ref",
             "--sort=-committerdate",
-            "--format=%(refname:short)%09%(committerdate:unix)",
+            "--format=%(refname:short)%09%(committerdate:unix)%09%(objectname)",
             &format!("refs/remotes/{JIST_REMOTE}/jist-*"),
         ],
         None,
     )?;
 
     refs.lines()
-        .filter_map(session_name_from_ref_line)
-        .map(|name| {
-            let claimed = claim_state_for_branch(&jist_branch_name(&name))?.is_claimed();
+        .filter_map(session_from_ref_line)
+        .map(|session| {
+            let jist_branch = jist_branch_name(&session.name);
+            let base_commit = git_output(
+                [
+                    "rev-parse",
+                    &format!("refs/remotes/{JIST_REMOTE}/{jist_branch}^"),
+                ],
+                None,
+            )?;
 
-            Ok(SessionInfo { name, claimed })
+            Ok(SessionInfo {
+                base_commit,
+                ..session
+            })
         })
         .collect()
 }
@@ -888,12 +1065,20 @@ fn parse_ls_remote_commit(branch_name: &str, output: &str) -> Result<Option<Stri
         .ok_or_else(|| format!("Could not parse remote branch `{branch_name}`."))
 }
 
-fn session_name_from_ref_line(line: &str) -> Option<String> {
-    let (ref_name, modified_at) = line.split_once('\t')?;
+fn session_from_ref_line(line: &str) -> Option<SessionInfo> {
+    let mut fields = line.split('\t');
+    let ref_name = fields.next()?;
+    let modified_at = fields.next()?;
+    let working_commit = fields.next()?;
     let name = ref_name.strip_prefix(&format!("{JIST_REMOTE}/jist-"))?;
-    let _modified_at: i64 = modified_at.parse().ok()?;
+    let modified_at_unix_seconds: i64 = modified_at.parse().ok()?;
 
-    Some(name.to_owned())
+    Some(SessionInfo {
+        name: name.to_owned(),
+        working_commit: working_commit.to_owned(),
+        base_commit: String::new(),
+        modified_at_unix_seconds,
+    })
 }
 
 fn session_name_from_jist_branch(branch_name: &str) -> Option<&str> {
@@ -943,6 +1128,7 @@ fn jist_repository_name(source_repo_name: &str) -> Result<String, String> {
     Ok(format!("{owner}/jist-{source_repo_name}"))
 }
 
+#[cfg(test)]
 fn github_commit_url(repository: &str, commit: &str) -> String {
     format!("https://github.com/{repository}/commit/{commit}")
 }
@@ -958,6 +1144,7 @@ fn jisthub_session_url(original_repository: &str, session_name: &str) -> Result<
     ))
 }
 
+#[cfg(test)]
 fn github_short_commit_url(repository: &str, commit: &str) -> Result<String, String> {
     let short_commit = git_output(["rev-parse", "--short", commit], None)?;
 
@@ -1192,10 +1379,13 @@ mod tests {
 
     #[test]
     fn parses_session_from_ref_line() {
-        let session = super::session_name_from_ref_line("jist/jist-test-session-2\t123").unwrap();
+        let session =
+            super::session_from_ref_line("jist/jist-test-session-2\t123\tabc123").unwrap();
 
-        assert_eq!(session, "test-session-2");
-        assert!(super::session_name_from_ref_line("origin/main\t123").is_none());
+        assert_eq!(session.name, "test-session-2");
+        assert_eq!(session.modified_at_unix_seconds, 123);
+        assert_eq!(session.working_commit, "abc123");
+        assert!(super::session_from_ref_line("origin/main\t123").is_none());
     }
 
     #[test]
@@ -1395,19 +1585,27 @@ mod tests {
         let sessions = vec![
             super::SessionInfo {
                 name: "newest".to_owned(),
-                claimed: false,
+                working_commit: "working-4".to_owned(),
+                base_commit: "base-4".to_owned(),
+                modified_at_unix_seconds: 4,
             },
             super::SessionInfo {
                 name: "current".to_owned(),
-                claimed: true,
+                working_commit: "working-3".to_owned(),
+                base_commit: "base-3".to_owned(),
+                modified_at_unix_seconds: 3,
             },
             super::SessionInfo {
                 name: "older".to_owned(),
-                claimed: false,
+                working_commit: "working-2".to_owned(),
+                base_commit: "base-2".to_owned(),
+                modified_at_unix_seconds: 2,
             },
             super::SessionInfo {
                 name: "oldest".to_owned(),
-                claimed: false,
+                working_commit: "working-1".to_owned(),
+                base_commit: "base-1".to_owned(),
+                modified_at_unix_seconds: 1,
             },
         ];
         let visible = super::visible_sessions(&sessions, Some("current"));
