@@ -6,6 +6,7 @@ use std::env;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
+use std::io::{self, Write};
 use std::process::{Command, ExitCode};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,6 +31,11 @@ enum CommandArgs {
     Claim,
     /// Check out an existing JIST session if the working tree is clean.
     Checkout {
+        /// Name for this JIST session.
+        session_name: String,
+    },
+    /// Delete a JIST session from the private remote.
+    Delete {
         /// Name for this JIST session.
         session_name: String,
     },
@@ -59,6 +65,7 @@ fn main() -> ExitCode {
     match Cli::parse().command {
         CommandArgs::Claim => claim(),
         CommandArgs::Checkout { session_name } => checkout(&session_name),
+        CommandArgs::Delete { session_name } => delete(&session_name),
         CommandArgs::List => list(),
         CommandArgs::Push => push(),
         CommandArgs::Session { session_name } => session(&session_name),
@@ -89,6 +96,19 @@ fn checkout(session_name: &str) -> ExitCode {
     match checkout_session(session_name) {
         Ok(()) => {
             println!("Checked out JIST session `{session_name}`.");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn delete(session_name: &str) -> ExitCode {
+    match delete_session(session_name) {
+        Ok(()) => {
+            println!("Deleted JIST session `{session_name}`.");
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -468,6 +488,43 @@ fn session(session_name: &str) -> ExitCode {
 fn checkout_session(session_name: &str) -> Result<(), String> {
     ensure_clean_worktree()?;
     checkout_jist_branch(&jist_branch_name(session_name))
+}
+
+fn delete_session(session_name: &str) -> Result<(), String> {
+    ensure_gh_installed()?;
+
+    let source_repo_name = repository_name()?;
+    let repository = jist_repository_name(&source_repo_name)?;
+    ensure_jist_remote(&repository)?;
+
+    let jist_branch = jist_branch_name(session_name);
+    if remote_branch_commit(&jist_branch)?.is_none() {
+        return Err(format!("JIST session `{session_name}` does not exist."));
+    }
+
+    require_delete_confirmation(session_name)?;
+    git_status(["push", JIST_REMOTE, &format!(":refs/heads/{jist_branch}")])?;
+    fetch_jist_sessions()?;
+
+    Ok(())
+}
+
+fn require_delete_confirmation(session_name: &str) -> Result<(), String> {
+    print!("Delete JIST session `{session_name}`? Type `confirm` to continue: ");
+    io::stdout()
+        .flush()
+        .map_err(|error| format!("Failed to write confirmation prompt: {error}"))?;
+
+    let mut response = String::new();
+    io::stdin()
+        .read_line(&mut response)
+        .map_err(|error| format!("Failed to read confirmation: {error}"))?;
+
+    if response.trim() == "confirm" {
+        Ok(())
+    } else {
+        Err("Delete cancelled.".to_owned())
+    }
 }
 
 fn ensure_clean_worktree() -> Result<(), String> {
