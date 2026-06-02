@@ -5,6 +5,7 @@ edition = "2024"
 description = "Joe's Intermediate Session Tracker CLI"
 
 [dependencies]
+chrono = "0.4.42"
 clap = { version = "4.5.51", features = ["derive"] }
 ctrlc = "3.5.1"
 notify = "8.2.0"

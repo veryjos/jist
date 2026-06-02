@@ -1,6 +1,6 @@
+use chrono::{DateTime, Datelike, Local};
 use clap::{Parser, Subcommand};
 use notify::{RecursiveMode, Watcher};
-#[cfg(test)]
 use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsStr;
@@ -45,8 +45,8 @@ enum CommandArgs {
     Version,
     /// Start a claimed JIST session and automatically push changes after a quiet period.
     Work {
-        /// Name for this JIST session.
-        session_name: String,
+        /// Name for this JIST session. Defaults to the current session.
+        session_name: Option<String>,
     },
 }
 
@@ -62,7 +62,7 @@ fn main() -> ExitCode {
             println!("{}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        CommandArgs::Work { session_name } => work(&session_name),
+        CommandArgs::Work { session_name } => work(session_name.as_deref()),
     }
 }
 
@@ -79,7 +79,7 @@ fn list() -> ExitCode {
     }
 }
 
-fn work(session_name: &str) -> ExitCode {
+fn work(session_name: Option<&str>) -> ExitCode {
     match work_session(session_name) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -152,14 +152,14 @@ fn render_status() -> Result<String, String> {
         .iter()
         .find(|session| session.working_commit == current_head)
     {
-        output.push_str(&format_session_working_commit_status(session)?);
+        output.push_str(&format_session_working_commit_status(session, None)?);
         output.push('\n');
         output.push_str("Sessions:\n");
         let session_refs: Vec<&SessionInfo> = sessions.iter().collect();
         output.push_str(&format_short_session_list(
             &session_refs,
             selected_session.as_deref(),
-        ));
+        )?);
 
         return Ok(output);
     }
@@ -173,14 +173,14 @@ fn render_status() -> Result<String, String> {
     output.push_str(&format_short_session_list(
         &based_on_current,
         selected_session.as_deref(),
-    ));
+    )?);
 
     output.push('\n');
     output.push_str("Other sessions in this repository:\n");
     output.push_str(&format_short_session_list(
         &other_sessions,
         selected_session.as_deref(),
-    ));
+    )?);
 
     output.push('\n');
     output.push_str("To display all sessions, type jist list.\n\n");
@@ -189,18 +189,125 @@ fn render_status() -> Result<String, String> {
     Ok(output)
 }
 
-fn format_session_working_commit_status(session: &SessionInfo) -> Result<String, String> {
+fn format_session_working_commit_status(
+    session: &SessionInfo,
+    push_deadline: Option<Instant>,
+) -> Result<String, String> {
     let original_repository = original_repository_name()?;
     let session_url = jisthub_session_url(&original_repository, &session.name)?;
     let short_base_commit = git_output(["rev-parse", "--short", &session.base_commit], None)?;
+    let jist_branch = jist_branch_name(&session.name);
+    let sync_status = sync_status_for_branch(&jist_branch)?;
+    let claim = remote_claim_info(&jist_branch)?;
+    let banner = format_session_working_commit_banner(session, &short_base_commit, claim.as_ref());
+    let work_indicator = format_session_work_indicator(claim.as_ref())?;
+    let sync_message = format_session_sync_status(&sync_status);
+    let sync_section = match push_deadline {
+        Some(deadline) => format!("{sync_message}\n{}", format_scheduled_sync(deadline)),
+        None => sync_message,
+    };
 
     Ok(format!(
-        "You are checked out on session {}.\nVisit {} for detailed information.\n\nThis session is based on {}.\nTo work on this session, type {}.\n",
-        format_selected_session_name(&session.name),
+        "{banner}\nVisit {} for detailed information.\n\n{}\n\n{}\n",
         format_url(&session_url),
-        format_blue(&short_base_commit),
-        format_blue("jist work")
+        sync_section,
+        work_indicator
     ))
+}
+
+fn format_session_working_commit_banner(
+    session: &SessionInfo,
+    short_base_commit: &str,
+    claim: Option<&ClaimInfo>,
+) -> String {
+    if claim
+        .map(|claim| claim.claimee_id.is_current_setup().unwrap_or(false))
+        .unwrap_or(false)
+    {
+        format!(
+            "You have {} session {}, based on {}.",
+            format_green("claimed"),
+            format_selected_session_name(&session.name),
+            format_blue(short_base_commit)
+        )
+    } else {
+        format!(
+            "You are checked out on session {}, based on {}.",
+            format_selected_session_name(&session.name),
+            format_blue(short_base_commit)
+        )
+    }
+}
+
+fn format_session_work_indicator(claim: Option<&ClaimInfo>) -> Result<String, String> {
+    match claim {
+        Some(claim) if claim.claimee_id.is_current_setup().unwrap_or(false) => Ok(format!(
+            "{}\nTo unclaim the current session, run {}.",
+            format_current_user_claim_message(claim),
+            format_blue("jist unclaim")
+        )),
+        Some(claim) => Ok(format!(
+            "This session is {} by another developer: {}.\n{}",
+            format_red("claimed"),
+            claim.claimee_id,
+            format_claim_duration(&claim)
+        )),
+        None => Ok(format!(
+            "To work on this session, type {}.",
+            format_blue("jist work")
+        )),
+    }
+}
+
+fn format_current_user_claim_message(claim: &ClaimInfo) -> String {
+    match claim.claimed_at_utc_unix_seconds {
+        Some(claimed_at) => format!(
+            "Your user ({}) created its claim {} ago.",
+            claim.claimee_id,
+            format_elapsed_since_unix_seconds(claimed_at)
+        ),
+        None => format!(
+            "Your user ({}) created its claim at an unknown time.",
+            claim.claimee_id
+        ),
+    }
+}
+
+fn format_claim_duration(claim: &ClaimInfo) -> String {
+    match claim.claimed_at_utc_unix_seconds {
+        Some(claimed_at) => format!(
+            "Claimed since {} ({} ago).",
+            format_local_claim_timestamp(claimed_at),
+            format_elapsed_since_unix_seconds(claimed_at)
+        ),
+        None => "Claimed for an unknown duration.".to_owned(),
+    }
+}
+
+fn format_local_claim_timestamp(unix_seconds: i64) -> String {
+    let timestamp = DateTime::from_timestamp(unix_seconds, 0)
+        .map(|utc| utc.with_timezone(&Local))
+        .unwrap_or_else(Local::now);
+    let month = timestamp.format("%B");
+    let day = timestamp.day();
+    let hour = timestamp.format("%-I%P");
+    let timezone = timestamp.format("%Z");
+
+    format!("{month} {} at {hour} {timezone}", format_ordinal_day(day))
+}
+
+fn format_ordinal_day(day: u32) -> String {
+    let suffix = match day % 100 {
+        11..=13 => "th",
+        _ => match day % 10 {
+            1 => "st",
+            2 => "nd",
+            3 => "rd",
+            _ => "th",
+        },
+    };
+
+    format!("{day}{suffix}")
 }
 
 fn render_all_sessions() -> Result<String, String> {
@@ -214,16 +321,22 @@ fn render_all_sessions() -> Result<String, String> {
     output.push_str(&format_full_session_list(
         &session_refs,
         selected_session.as_deref(),
-    ));
+    )?);
 
     Ok(output)
 }
 
-fn format_short_session_list(sessions: &[&SessionInfo], selected_session: Option<&str>) -> String {
+fn format_short_session_list(
+    sessions: &[&SessionInfo],
+    selected_session: Option<&str>,
+) -> Result<String, String> {
     format_session_list(sessions, Some(STATUS_SESSION_LIMIT), selected_session)
 }
 
-fn format_full_session_list(sessions: &[&SessionInfo], selected_session: Option<&str>) -> String {
+fn format_full_session_list(
+    sessions: &[&SessionInfo],
+    selected_session: Option<&str>,
+) -> Result<String, String> {
     format_session_list(sessions, None, selected_session)
 }
 
@@ -231,7 +344,7 @@ fn format_session_list(
     sessions: &[&SessionInfo],
     limit: Option<usize>,
     selected_session: Option<&str>,
-) -> String {
+) -> Result<String, String> {
     let mut output = String::new();
 
     if sessions.is_empty() {
@@ -239,10 +352,12 @@ fn format_session_list(
     } else {
         let visible_count = limit.unwrap_or(sessions.len()).min(sessions.len());
         for session in sessions.iter().take(visible_count) {
+            let current = selected_session == Some(session.name.as_str());
+            let claimed = remote_claim_info(&jist_branch_name(&session.name))?.is_some();
             output.push_str(&format!(
                 "  - {} ({})\n",
                 format_session_name(&session.name, selected_session),
-                format_last_modified(session.modified_at_unix_seconds)
+                format_session_list_metadata(session, current, claimed)
             ));
         }
 
@@ -255,7 +370,22 @@ fn format_session_list(
         }
     }
 
-    output
+    Ok(output)
+}
+
+fn format_session_list_metadata(session: &SessionInfo, current: bool, claimed: bool) -> String {
+    let mut metadata = Vec::new();
+
+    if current {
+        metadata.push(format_green("current session"));
+    }
+
+    if claimed {
+        metadata.push(format_green("claimed"));
+    }
+
+    metadata.push(format_last_modified(session.modified_at_unix_seconds));
+    metadata.join(", ")
 }
 
 fn selected_session_name(
@@ -270,6 +400,13 @@ fn selected_session_name(
     }
 
     selected_session()
+}
+
+fn current_session_name() -> Result<Option<String>, String> {
+    let sessions = list_sessions()?;
+    let current_head = git_output(["rev-parse", "HEAD"], None)?;
+
+    selected_session_name(&sessions, &current_head)
 }
 
 fn format_session_name(session_name: &str, selected_session: Option<&str>) -> String {
@@ -297,9 +434,18 @@ fn session(session_name: &str) -> ExitCode {
     }
 }
 
-fn work_session(session_name: &str) -> Result<(), String> {
-    ensure_clean_worktree()?;
-    start_jist_session(session_name)?;
+fn work_session(session_name: Option<&str>) -> Result<(), String> {
+    let session_name = match session_name {
+        Some(session_name) => {
+            start_jist_session(session_name)?;
+            session_name.to_owned()
+        }
+        None => current_session_name()?.ok_or_else(|| {
+            "Check out a JIST session or pass a session name before running `jist work`.".to_owned()
+        })?,
+    };
+
+    ensure_fully_synchronized(&jist_branch_name(&session_name))?;
     claim_session()?;
 
     let result = run_work_loop();
@@ -315,21 +461,13 @@ fn work_session(session_name: &str) -> Result<(), String> {
     }
 }
 
-fn ensure_clean_worktree() -> Result<(), String> {
-    let status = git_output(["status", "--porcelain"], None)?;
-
-    if status.is_empty() {
-        Ok(())
-    } else {
-        Err("`jist work` requires a clean git working tree.".to_owned())
-    }
-}
-
 fn run_work_loop() -> Result<(), String> {
     let running = Arc::new(AtomicBool::new(true));
     let signal_running = Arc::clone(&running);
     ctrlc::set_handler(move || {
-        signal_running.store(false, Ordering::SeqCst);
+        if signal_running.swap(false, Ordering::SeqCst) {
+            eprintln!("Ctrl+C pressed. Attempting to unclaim and exit...");
+        }
     })
     .map_err(|error| format!("Failed to install Ctrl+C handler: {error}"))?;
 
@@ -347,7 +485,7 @@ fn run_work_loop() -> Result<(), String> {
 
     let mut push_deadline: Option<Instant> = None;
     let mut message = "Watching for changes. Press Ctrl+C to unclaim and exit.".to_owned();
-    render_work_status(&message)?;
+    render_work_status(&message, push_deadline)?;
 
     while running.load(Ordering::SeqCst) {
         match rx.recv_timeout(Duration::from_secs(1)) {
@@ -358,14 +496,16 @@ fn run_work_loop() -> Result<(), String> {
                         "Change detected. Next push after {} minutes of quiet.",
                         WORK_PUSH_DEBOUNCE.as_secs() / 60
                     );
-                    render_work_status(&message)?;
+                    render_work_status(&message, push_deadline)?;
                 }
             }
             Ok(Err(error)) => {
                 message = format!("Filesystem watcher warning: {error}");
-                render_work_status(&message)?;
+                render_work_status(&message, push_deadline)?;
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                render_work_status(&message, push_deadline)?;
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return Err("Filesystem watcher stopped unexpectedly.".to_owned());
             }
@@ -373,7 +513,7 @@ fn run_work_loop() -> Result<(), String> {
 
         if push_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             message = "Pushing changes...".to_owned();
-            render_work_status(&message)?;
+            render_work_status(&message, push_deadline)?;
 
             match push_session() {
                 Ok(session) => {
@@ -386,21 +526,44 @@ fn run_work_loop() -> Result<(), String> {
                 }
             }
 
-            render_work_status(&message)?;
+            render_work_status(&message, push_deadline)?;
         }
     }
 
-    render_work_status("Stopping. Unclaiming session...")?;
+    render_work_status("Stopping. Unclaiming session...", push_deadline)?;
     Ok(())
 }
 
-fn render_work_status(message: &str) -> Result<(), String> {
+fn render_work_status(message: &str, push_deadline: Option<Instant>) -> Result<(), String> {
     print!("\x1b[2J\x1b[H");
-    print!("{}", render_status()?);
+    print!("{}", render_work_session_status(push_deadline)?);
     println!();
     println!("Work: {message}");
 
     Ok(())
+}
+
+fn format_scheduled_sync(deadline: Instant) -> String {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let total_seconds = remaining.as_secs();
+    let minutes = total_seconds / 60;
+    let seconds = total_seconds % 60;
+
+    format!("Sync scheduled in {minutes}:{seconds:02}")
+}
+
+fn render_work_session_status(push_deadline: Option<Instant>) -> Result<String, String> {
+    let sessions = list_sessions()?;
+    let current_head = git_output(["rev-parse", "HEAD"], None)?;
+
+    if let Some(session) = sessions
+        .iter()
+        .find(|session| session.working_commit == current_head)
+    {
+        format_session_working_commit_status(session, push_deadline)
+    } else {
+        render_status()
+    }
 }
 
 fn is_git_internal_path(path: &std::path::Path) -> bool {
@@ -467,6 +630,7 @@ fn claim_session() -> Result<String, String> {
     let repository = jist_repository_name(&source_repo_name)?;
     ensure_jist_remote(&repository)?;
     fetch_jist_branch(&current_branch)?;
+    ensure_fully_synchronized(&current_branch)?;
     ensure_unclaimed(&current_branch)?;
 
     fs::write(".jist-meta", claim_metadata()?)
@@ -481,6 +645,20 @@ fn claim_session() -> Result<String, String> {
     ])?;
 
     Ok(session_name)
+}
+
+fn ensure_fully_synchronized(jist_branch: &str) -> Result<(), String> {
+    let sync_status = sync_status_for_branch(jist_branch)?;
+
+    if sync_status.unsynced_files == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "Cannot claim this JIST session while {} {} unsynchronized.",
+            sync_status.unsynced_files,
+            pluralize("file", sync_status.unsynced_files)
+        ))
+    }
 }
 
 fn push_session() -> Result<String, String> {
@@ -565,6 +743,10 @@ fn ensure_unclaimed(jist_branch: &str) -> Result<(), String> {
 }
 
 fn remote_claim_owner(jist_branch: &str) -> Result<Option<ClaimeeId>, String> {
+    Ok(remote_claim_info(jist_branch)?.map(|claim| claim.claimee_id))
+}
+
+fn remote_claim_info(jist_branch: &str) -> Result<Option<ClaimInfo>, String> {
     let metadata = git_output(
         [
             "show",
@@ -572,21 +754,35 @@ fn remote_claim_owner(jist_branch: &str) -> Result<Option<ClaimeeId>, String> {
         ],
         None,
     )?;
+    let claimed_at_utc_unix_seconds = metadata_value(&metadata, "claimed_at_utc_unix_seconds")
+        .and_then(|value| value.parse().ok());
 
     if let Some(claimee_id) = metadata_value(&metadata, "claimee_id") {
-        return Ok(Some(ClaimeeId::parse(claimee_id)?));
+        return Ok(Some(ClaimInfo {
+            claimee_id: ClaimeeId::parse(claimee_id)?,
+            claimed_at_utc_unix_seconds,
+        }));
     }
 
     match (
         metadata_value(&metadata, "machine_id"),
         metadata_value(&metadata, "local_user"),
     ) {
-        (Some(machine_id), Some(local_user)) => Ok(Some(ClaimeeId {
-            user: local_user.to_owned(),
-            machine: machine_id.to_owned(),
+        (Some(machine_id), Some(local_user)) => Ok(Some(ClaimInfo {
+            claimee_id: ClaimeeId {
+                user: local_user.to_owned(),
+                machine: machine_id.to_owned(),
+            },
+            claimed_at_utc_unix_seconds,
         })),
         _ => Ok(None),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClaimInfo {
+    claimee_id: ClaimeeId,
+    claimed_at_utc_unix_seconds: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -710,7 +906,6 @@ struct SessionLinks {
     claim_state: ClaimState,
 }
 
-#[cfg(test)]
 struct SyncStatus {
     unsynced_files: usize,
     total_files: usize,
@@ -767,7 +962,6 @@ fn claim_state_for_branch(jist_branch: &str) -> Result<ClaimState, String> {
     }
 }
 
-#[cfg(test)]
 fn sync_status_for_branch(jist_branch: &str) -> Result<SyncStatus, String> {
     let remote_ref = format!("refs/remotes/{JIST_REMOTE}/{jist_branch}");
     let changed_files = git_output(["diff", "--name-only", &remote_ref, "--"], None)?;
@@ -788,9 +982,33 @@ fn sync_status_for_branch(jist_branch: &str) -> Result<SyncStatus, String> {
     })
 }
 
-#[cfg(test)]
 fn non_empty_lines(value: &str) -> impl Iterator<Item = &str> {
     value.lines().filter(|line| !line.trim().is_empty())
+}
+
+fn format_session_sync_status(sync_status: &SyncStatus) -> String {
+    if sync_status.unsynced_files == 0 {
+        format!(
+            "All {} {} {} \x1b[32mfully synced\x1b[0m.",
+            sync_status.total_files,
+            pluralize("file", sync_status.total_files),
+            pluralized_verb(sync_status.total_files)
+        )
+    } else {
+        let synchronized_files = sync_status
+            .total_files
+            .saturating_sub(sync_status.unsynced_files);
+
+        format!(
+            "{} {} {} \x1b[31munsynchronized\x1b[0m.\n{} {} {} \x1b[32msynchronized\x1b[0m.",
+            sync_status.unsynced_files,
+            pluralize("file", sync_status.unsynced_files),
+            pluralized_verb(sync_status.unsynced_files),
+            synchronized_files,
+            pluralize("file", synchronized_files),
+            pluralized_verb(synchronized_files)
+        )
+    }
 }
 
 #[cfg(test)]
@@ -830,23 +1048,29 @@ fn format_session_state_message(
         ),
         ClaimState::ClaimedByCurrentSetup => match sync_status {
             Some(sync_status) if sync_status.unsynced_files == 0 => format!(
-                "You have \x1b[32mclaimed\x1b[0m the working commit for session {}.\n{}\n\nThis session is based on:\n{}\n\nAll {} files are \x1b[32mfully synced\x1b[0m.\n",
+                "You have \x1b[32mclaimed\x1b[0m the working commit for session {}.\n{}\n\nThis session is based on:\n{}\n\nAll {} {} {} \x1b[32mfully synced\x1b[0m.\n",
                 format_current_session_name(session_name, true),
                 format_url(sessionbase_url),
                 format_url(sessionbase_commit_url),
-                sync_status.total_files
+                sync_status.total_files,
+                pluralize("file", sync_status.total_files),
+                pluralized_verb(sync_status.total_files)
             ),
             Some(sync_status) => {
                 let synchronized_files = sync_status
                     .total_files
                     .saturating_sub(sync_status.unsynced_files);
                 format!(
-                    "You have \x1b[32mclaimed\x1b[0m the working commit for session {}.\n{}\n\nThis session is based on:\n{}\n\n{} files are \x1b[31munsynchronized\x1b[0m.\n{} files are \x1b[32msynchronized\x1b[0m.\n",
+                    "You have \x1b[32mclaimed\x1b[0m the working commit for session {}.\n{}\n\nThis session is based on:\n{}\n\n{} {} {} \x1b[31munsynchronized\x1b[0m.\n{} {} {} \x1b[32msynchronized\x1b[0m.\n",
                     format_current_session_name(session_name, true),
                     format_url(sessionbase_url),
                     format_url(sessionbase_commit_url),
                     sync_status.unsynced_files,
-                    synchronized_files
+                    pluralize("file", sync_status.unsynced_files),
+                    pluralized_verb(sync_status.unsynced_files),
+                    synchronized_files,
+                    pluralize("file", synchronized_files),
+                    pluralized_verb(synchronized_files)
                 )
             }
             None => format!(
@@ -907,6 +1131,14 @@ fn format_blue(text: &str) -> String {
     format!("\x1b[34m{text}\x1b[0m")
 }
 
+fn format_green(text: &str) -> String {
+    format!("\x1b[32m{text}\x1b[0m")
+}
+
+fn format_red(text: &str) -> String {
+    format!("\x1b[31m{text}\x1b[0m")
+}
+
 fn format_url(url: &str) -> String {
     format!("\x1b[34;4m{url}\x1b[0m")
 }
@@ -924,6 +1156,10 @@ fn format_last_modified(unix_seconds: i64) -> String {
 }
 
 fn format_time_since_unix_seconds(unix_seconds: i64) -> String {
+    format!("{} ago", format_elapsed_since_unix_seconds(unix_seconds))
+}
+
+fn format_elapsed_since_unix_seconds(unix_seconds: i64) -> String {
     let now_seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
@@ -938,7 +1174,7 @@ fn format_duration(total_seconds: u64) -> String {
     let hours = (total_seconds % 86_400) / 3_600;
     let minutes = (total_seconds % 3_600) / 60;
 
-    format!("{days}d {hours}h {minutes}m ago")
+    format!("{days}d {hours}h {minutes}m")
 }
 
 fn pluralize(word: &str, count: usize) -> &str {
@@ -949,6 +1185,10 @@ fn pluralize(word: &str, count: usize) -> &str {
     } else {
         "files"
     }
+}
+
+fn pluralized_verb(count: usize) -> &'static str {
+    if count == 1 { "is" } else { "are" }
 }
 
 #[cfg(test)]
@@ -1427,6 +1667,20 @@ mod tests {
 
     #[test]
     fn formats_sync_status() {
+        assert_eq!(
+            super::format_session_sync_status(&super::SyncStatus {
+                unsynced_files: 1,
+                total_files: 5,
+            }),
+            "1 file is \x1b[31munsynchronized\x1b[0m.\n4 files are \x1b[32msynchronized\x1b[0m."
+        );
+        assert_eq!(
+            super::format_session_sync_status(&super::SyncStatus {
+                unsynced_files: 0,
+                total_files: 1,
+            }),
+            "All 1 file is \x1b[32mfully synced\x1b[0m."
+        );
         assert_eq!(
             super::format_sync_status(&super::SyncStatus {
                 unsynced_files: 0,
