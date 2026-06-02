@@ -28,6 +28,11 @@ struct Cli {
 enum CommandArgs {
     /// Claim the current JIST session for this machine.
     Claim,
+    /// Check out an existing JIST session if the working tree is clean.
+    Checkout {
+        /// Name for this JIST session.
+        session_name: String,
+    },
     /// List all JIST sessions on the private remote.
     List,
     /// Push the current JIST session changes if this machine owns the claim.
@@ -53,6 +58,7 @@ enum CommandArgs {
 fn main() -> ExitCode {
     match Cli::parse().command {
         CommandArgs::Claim => claim(),
+        CommandArgs::Checkout { session_name } => checkout(&session_name),
         CommandArgs::List => list(),
         CommandArgs::Push => push(),
         CommandArgs::Session { session_name } => session(&session_name),
@@ -70,6 +76,19 @@ fn list() -> ExitCode {
     match render_all_sessions() {
         Ok(output) => {
             print!("{output}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn checkout(session_name: &str) -> ExitCode {
+    match checkout_session(session_name) {
+        Ok(()) => {
+            println!("Checked out JIST session `{session_name}`.");
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -168,8 +187,14 @@ fn render_status() -> Result<String, String> {
         .iter()
         .partition(|session| session.base_commit == current_head);
 
-    output.push_str(&format!("You are on git commit {current_short_head}.\n\n"));
-    output.push_str("The following sessions are based on this commit:\n");
+    output.push_str(&format!(
+        "You are on git commit {}.\n",
+        format_blue(&current_short_head)
+    ));
+    output.push_str(&format!(
+        "The following sessions are {}:\n",
+        format_green("based on this commit")
+    ));
     output.push_str(&format_short_session_list(
         &based_on_current,
         selected_session.as_deref(),
@@ -183,8 +208,14 @@ fn render_status() -> Result<String, String> {
     )?);
 
     output.push('\n');
-    output.push_str("To display all sessions, type jist list.\n\n");
-    output.push_str("To work on a session, type jist work <session name>.\n");
+    output.push_str(&format!(
+        "To display all sessions, run {}.\n",
+        format_blue("jist list")
+    ));
+    output.push_str(&format!(
+        "To work on a session, run {}.\n",
+        format_blue("jist work <session name>")
+    ));
 
     Ok(output)
 }
@@ -431,6 +462,21 @@ fn session(session_name: &str) -> ExitCode {
             eprintln!("{error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn checkout_session(session_name: &str) -> Result<(), String> {
+    ensure_clean_worktree()?;
+    checkout_jist_branch(&jist_branch_name(session_name))
+}
+
+fn ensure_clean_worktree() -> Result<(), String> {
+    let status = git_output(["status", "--porcelain"], None)?;
+
+    if status.is_empty() {
+        Ok(())
+    } else {
+        Err("Cannot check out a JIST session with uncommitted working changes.".to_owned())
     }
 }
 
